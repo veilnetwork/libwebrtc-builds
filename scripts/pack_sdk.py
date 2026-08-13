@@ -131,15 +131,23 @@ class Copier:
         self._account(bucket, os.path.getsize(src))
         return True
 
-    def copy_headers(self, rel_root: str, bucket: str) -> None:
+    def copy_headers(self, rel_root: str, bucket: str,
+                     skip_abs: "set[str] | None" = None) -> None:
         abs_root = os.path.join(self.src_root, rel_root)
         if not os.path.isdir(abs_root):
             log(f"    (absent: {rel_root})")
             return
+        skip_abs = skip_abs or set()
         n = 0
         nbytes = 0
         for dirpath, dirnames, filenames in os.walk(abs_root):
             dirnames[:] = [d for d in dirnames if d not in (".git", "out")]
+            # The sysroot lives under build/ and is copied WHOLE further down.
+            # Walking it for headers first copied 23 749 files / 204.6 MiB on
+            # linux-x64 that the sysroot pass then wrote again — the bundle was
+            # carrying its own sysroot headers twice.
+            dirnames[:] = [d for d in dirnames
+                           if os.path.join(dirpath, d) not in skip_abs]
             for fn in filenames:
                 if not is_header(fn):
                     continue
@@ -266,15 +274,34 @@ def main() -> int:
     os.makedirs(stage_src)
     cp = Copier(src, stage_src)
 
+    # Locate the sysroot BEFORE walking for headers. It lives under build/ on
+    # Linux and under third_party/ on Android, and it is copied whole further
+    # down — so the header walk has to be told to leave it alone or the bundle
+    # carries every sysroot header twice.
+    sysroot_rel = find_sysroot(cmd)
+    sysroot_abs = ""
+    sysroot_note = "none (host toolchain)"
+    if sysroot_rel:
+        candidate = os.path.normpath(os.path.join(entry["directory"], sysroot_rel))
+        # realpath, not the literal path: on macOS `-isysroot` points at
+        # out/<t>/sdk/xcode_links/MacOSX*.sdk, which LOOKS like it is inside the
+        # checkout and is a symlink into Xcode. Following it would copy several
+        # gigabytes of Apple SDK into a bundle that must not carry it.
+        inside = (os.path.realpath(candidate)
+                  .startswith(os.path.realpath(src) + os.sep))
+        if inside and os.path.isdir(candidate) and not os.path.islink(candidate):
+            sysroot_abs = candidate
+
     log("==> headers from the WebRTC tree")
+    skip = {sysroot_abs} if sysroot_abs else set()
     for name in sorted(os.listdir(src)):
         if name in SKIP_TOP:
             continue
         if os.path.isdir(os.path.join(src, name)):
-            cp.copy_headers(name, "headers")
+            cp.copy_headers(name, "headers", skip_abs=skip)
     log("==> headers from the named third_party roots")
     for root in EXTRA_HEADER_ROOTS:
-        cp.copy_headers(root, "headers")
+        cp.copy_headers(root, "headers", skip_abs=skip)
     for extra in EXTRA_FILES:
         if cp.copy_file(extra, "headers"):
             log(f"    {extra}")
@@ -298,17 +325,8 @@ def main() -> int:
                  keep=lambda r: is_header(os.path.basename(r)))
     cp.copy_file(os.path.join(args.out, "args.gn"), "gen")
 
-    sysroot_rel = find_sysroot(cmd)
-    sysroot_note = "none (host toolchain)"
     if sysroot_rel:
-        sysroot_abs = os.path.normpath(os.path.join(entry["directory"], sysroot_rel))
-        # realpath, not the literal path: on macOS `-isysroot` points at
-        # out/<t>/sdk/xcode_links/MacOSX*.sdk, which LOOKS like it is inside
-        # the checkout and is a symlink into Xcode. Following it would copy
-        # several gigabytes of Apple SDK into a bundle that must not carry it.
-        inside = (os.path.realpath(sysroot_abs)
-                  .startswith(os.path.realpath(src) + os.sep))
-        if inside and os.path.isdir(sysroot_abs) and not os.path.islink(sysroot_abs):
+        if sysroot_abs:
             rel_root = os.path.relpath(sysroot_abs, src)
             log(f"==> sysroot {rel_root}")
             if android:
