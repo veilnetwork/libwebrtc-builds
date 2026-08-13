@@ -1,3 +1,5 @@
 veil-webrtc-sdk-*/
 *.tar.xz
 *.zip
+__pycache__/
+*.pyc
