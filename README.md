@@ -95,6 +95,7 @@ local checkout, so these are measured and not estimated):
 | generated headers (`out/<target>/gen`) | 6.7 MiB | 353 |
 | libc++ / libc++abi objects | 1.8 MiB | 66 |
 | **total, uncompressed** | **353.2 MiB** | |
+| **the published `.tar.xz`** | **66.4 MiB** | |
 
 `libwebrtc.a` itself, measured directly, is **33.1 MiB** on `mac-arm64`
 (34 757 200 bytes), **32.1 MiB** on `ios-arm64` and **32.3 MiB** on
@@ -129,17 +130,24 @@ wrapper build consumes in under twenty seconds. Splitting them is the entire
 point: the wrapper becomes buildable locally, in minutes, by anyone.
 
 **Demonstrated**, not projected. On 2026-08-13 the `mac-arm64` bundle was cut
-from a local checkout, the 33 GB checkout was renamed out of the way, and the
-wrapper was built against the bundle alone:
+from a local checkout, compressed to the asset that is published, extracted
+into an empty directory, and the 33 GB checkout was **renamed out of the way**
+before the wrapper was built against the extract alone:
 
 ```
 ==> done: libveil_media.dylib (5.1M)
 exported veil_media_* symbols: 87
-=== build rc=0 elapsed=10s ===
+=== build rc=0 elapsed=9s ===
 ```
 
-Ten seconds, and `check-media-symbols.sh` reports `87 exported / 87 looked up
-by Dart, OK`.
+Nine seconds against roughly forty minutes, and xVeil's own
+`scripts/check-media-symbols.sh` reports `Mach-O: exported 87, looked up by
+Dart: 87 — OK: nothing the app calls is missing from the engine`.
+
+The round trip matters as much as the build: a bundle tested in its staging
+directory can pass on file modes and symlinks that a tar does not carry. This
+one was tested after `tar | xz` and extraction, and `clang++ -> clang`,
+`ld.lld -> lld` and the executable bits all survive.
 
 ---
 
