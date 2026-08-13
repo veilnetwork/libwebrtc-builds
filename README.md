@@ -106,21 +106,35 @@ GitHub caps a release asset at 2 GB. Nothing here is near it: the largest
 component is a ~260 MiB toolchain, and the whole bundle compresses from ~353
 MiB. The cap does not shape this design.
 
-Per target, as published:
+Per target, as published in
+[`webrtc-4ef980bc…`](https://github.com/veilnetwork/libwebrtc-builds/releases/tag/webrtc-4ef980bc2c70834276c791e71e7834b8809f24ad):
 
 | Target | `libwebrtc.a` | bundle, uncompressed | bundle, published |
 |---|---|---|---|
-| `mac-arm64` | 33.1 MiB (34 757 200 B) | 353.2 MiB | 66.4 MiB |
-| `ios-arm64` | 32.1 MiB (33 655 768 B) | 352.3 MiB | 66.2 MiB |
-| `linux-x64` | see the release | | |
-| `android-arm64` | see the release | | |
-| `win-x64` | not yet built | | |
+| `mac-arm64` | 33.1 MiB (34 757 200 B) | 353.2 MiB | **66.4 MiB** |
+| `ios-arm64` | 32.1 MiB (33 655 768 B) | 352.3 MiB | **66.2 MiB** |
+| `linux-x64` | 47.3 MiB (49 588 622 B) | 926.3 MiB | **186.7 MiB** |
+| `android-arm64` | 51.4 MiB (53 946 302 B) | 857.6 MiB | **191.9 MiB** |
+| `win-x64` | not built yet | | |
 
 > The Linux and Android bundles are larger than the Apple ones, because they
-> also carry a sysroot — a Debian bullseye sysroot on Linux, the NDK's
-> aarch64 sysroot on Android — where macOS and iOS take theirs from the Xcode
-> already installed on the consumer's machine. Apple's SDK is not ours to
-> redistribute and `setup.sh` repoints `-isysroot` at the local one instead.
+> also carry a sysroot — a Debian bullseye sysroot on Linux (166.0 MiB), the
+> NDK's aarch64 sysroot on Android (90.9 MiB, pruned to the one architecture)
+> — where macOS and iOS take theirs from the Xcode already installed on the
+> consumer's machine. Apple's SDK is not ours to redistribute and `setup.sh`
+> repoints `-isysroot` at the local one instead.
+>
+> Their *uncompressed* figures above are also inflated by a packaging bug
+> those two bundles were built with: the sysroot lives under `build/`, so it
+> was walked for headers and then copied again wholesale — 204.6 MiB of
+> `build/` headers on `linux-x64` that were already in the sysroot copy. Fixed
+> in `pack_sdk.py` after this run. The published assets are correct, just
+> fatter than they need to be; the next pin bump will produce smaller ones.
+
+The largest single component is the clang/lld toolchain: 260.6 MiB on macOS,
+448.9 MiB on Linux. It is bundled rather than fetched from Google because a
+second network dependency is a second thing that can be unavailable, and
+because 450 MiB next to a 33 GB checkout is not the problem worth solving.
 
 ---
 
@@ -139,6 +153,21 @@ Measured on the xVeil `webrtc-linux` workflow, run `31609030118`
 Roughly forty minutes and ~33 GB of disk produce an input that the actual
 wrapper build consumes in under twenty seconds. Splitting them is the entire
 point: the wrapper becomes buildable locally, in minutes, by anyone.
+
+This repository's own first run,
+[31676947631](https://github.com/veilnetwork/libwebrtc-builds/actions/runs/31676947631),
+reproduces those figures and adds what it costs to package:
+
+| Step | linux-x64 | android-arm64 |
+|---|---|---|
+| `gclient sync` | 25m 59s | 25m 25s |
+| `ninja … webrtc` | 12m 41s | 15m 26s |
+| package the bundle | 6s | 11s |
+| **verify: build the wrapper from the bundle, checkout hidden** | **10s** | **10s** |
+| compress | 1m 42s | 1m 35s |
+
+So the cost of publishing is about two minutes on top of a build that had to
+happen anyway — and it is paid once per pin instead of once per contributor.
 
 **Demonstrated**, not projected. On 2026-08-13 the `mac-arm64` bundle was cut
 from a local checkout, compressed to the asset that is published, extracted
@@ -254,6 +283,15 @@ fetch — the manifest is published as its own small asset for exactly this.
 
 `libwebrtc_sha256` additionally makes a truncated or substituted download
 detectable, which a byte count alone does not.
+
+`fetch-sdk.sh` does all of this. Tested against the live release:
+
+| | |
+|---|---|
+| correct pin | downloads, checksums, sets up — exit 0 |
+| wrong `--expect-pin`, real tag | refuses **before** downloading the bundle, naming both revisions — exit 1 |
+| no `--expect-pin` at all | refuses — exit 2 |
+| correct pin, already present | reuses the extracted bundle, no download — exit 0 |
 
 ---
 
