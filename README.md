@@ -106,10 +106,21 @@ GitHub caps a release asset at 2 GB. Nothing here is near it: the largest
 component is a ~260 MiB toolchain, and the whole bundle compresses from ~353
 MiB. The cap does not shape this design.
 
-> Sizes for `linux-x64`, `android-arm64` and `win-x64` are filled in from the
-> first published run — they are not the same as macOS, because those bundles
-> also carry a sysroot (a Debian bullseye sysroot on Linux, the NDK's aarch64
-> sysroot on Android) that macOS gets from local Xcode.
+Per target, as published:
+
+| Target | `libwebrtc.a` | bundle, uncompressed | bundle, published |
+|---|---|---|---|
+| `mac-arm64` | 33.1 MiB (34 757 200 B) | 353.2 MiB | 66.4 MiB |
+| `ios-arm64` | 32.1 MiB (33 655 768 B) | 352.3 MiB | 66.2 MiB |
+| `linux-x64` | see the release | | |
+| `android-arm64` | see the release | | |
+| `win-x64` | not yet built | | |
+
+> The Linux and Android bundles are larger than the Apple ones, because they
+> also carry a sysroot — a Debian bullseye sysroot on Linux, the NDK's
+> aarch64 sysroot on Android — where macOS and iOS take theirs from the Xcode
+> already installed on the consumer's machine. Apple's SDK is not ours to
+> redistribute and `setup.sh` repoints `-isysroot` at the local one instead.
 
 ---
 
@@ -274,8 +285,17 @@ gh release upload webrtc-<sha> sdk.tar.xz
 
 This is the larger win for iOS specifically: `build_veil_media_ios.sh` today
 runs `gn gen` and `autoninja` itself, so an iOS contributor needs the whole
-33 GB checkout. With a bundle they need ~350 MB and the `gn`/`ninja` steps are
-skipped entirely.
+33 GB checkout. With a bundle they need a 66 MiB download, and the `gn`/`ninja`
+steps go away.
+
+Measured, with the checkout renamed away: the eight iOS translation units
+compile and archive in **8 seconds**, producing an arm64 `libveil_media.a`
+exporting all 87 `veil_media_*` symbols.
+
+For that to be a one-liner rather than the reproduction in `verify-sdk.sh`,
+`build_veil_media_ios.sh` needs one guard so its `gn gen` / `autoninja` block
+is skipped when `WEBRTC_SRC` already points at a bundle. That edit belongs in
+the `veil` repository, not here.
 
 ---
 
