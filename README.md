@@ -284,6 +284,21 @@ naming a directory the compiler never finds — and it says so as a wall of
 missing headers rather than as a bad path. `fetch-sdk.sh` picks the right one
 by target.
 
+**`setup.ps1` needs PowerShell 7, not Windows PowerShell 5.1.** It rewrites the
+shipped template through a variable property name — `$e.$k = $e.$k.Replace(…)`
+on what `ConvertFrom-Json` returned — and 5.1 answers `The property 'directory'
+cannot be found on this object` at `setup.ps1:81`. This went unseen because
+every green run of it came from `verify-sdk.ps1` inside a `shell: pwsh` step;
+the first caller that named a PowerShell was `fetch-sdk.sh`, and it named
+`powershell.exe`. Measured on one runner against one bundle, back to back:
+5.1.26100.33158 exits 1, pwsh 7.6.4 repoints the nine `-imsvc` paths and writes
+`compile_commands.json` (xVeil run
+[31714489182](https://github.com/veilnetwork/xVeil/actions/runs/31714489182)).
+`fetch-sdk.sh` now prefers `pwsh` and keeps `powershell.exe` only as a fallback.
+The durable fix belongs in `pack_sdk.py`'s `SETUP_PS1`, so the bundle itself
+works on a machine that has only 5.1 — that changes the *next* bundle, not the
+published one, which is why the consumer side is fixed first.
+
 No token is needed. Release assets are public — unlike GitHub *run* artifacts,
 which need credentials to download and expire after the retention window. That
 expiry is not hypothetical for this project: xVeil's `fetch-deps.py` carries a

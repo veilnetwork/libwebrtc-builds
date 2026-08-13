@@ -98,7 +98,32 @@ fi
 case "$TARGET" in
   win-*)
     WIN_BUNDLE="$(cygpath -w "$BUNDLE" 2>/dev/null || printf '%s' "$BUNDLE")"
-    powershell.exe -NoProfile -ExecutionPolicy Bypass \
+    # pwsh FIRST, and not as a preference. setup.ps1 assigns through a
+    # variable property name — `$e.$k = $e.$k.Replace(…)` on what
+    # ConvertFrom-Json returned — and Windows PowerShell 5.1 refuses it:
+    #
+    #   The property 'directory' cannot be found on this object.
+    #   At …\veil-webrtc-sdk-win-x64\setup.ps1:81 char:5
+    #
+    # Proved on one runner against one bundle, both hosts back to back:
+    # 5.1.26100.33158 exits 1 there, pwsh 7.6.4 repoints the nine -imsvc
+    # paths and writes compile_commands.json (xVeil run 31714489182). Every
+    # green setup.ps1 before that had been called from verify-sdk.ps1 inside
+    # a `shell: pwsh` step, so this line — the only caller that names a
+    # PowerShell — was the one place the 5.1 incompatibility could hide.
+    #
+    # powershell.exe stays as the fallback rather than being removed: a
+    # machine with only 5.1 should fail inside setup.ps1, with the line and
+    # the reason, rather than here with "no PowerShell".
+    ps_host=""
+    for candidate in pwsh powershell.exe; do
+      if command -v "$candidate" >/dev/null 2>&1; then ps_host="$candidate"; break; fi
+    done
+    [ -n "$ps_host" ] || {
+      echo "::error::a windows bundle is laid out by setup.ps1 and neither pwsh nor powershell.exe is on PATH" >&2
+      exit 1; }
+    echo "==> laying the bundle out with $ps_host" >&2
+    "$ps_host" -NoProfile -ExecutionPolicy Bypass \
       -File "${WIN_BUNDLE}\\setup.ps1" >&2
     SRC="${WIN_BUNDLE}\\src"
     ;;
