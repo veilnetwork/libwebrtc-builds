@@ -121,7 +121,16 @@ Per target, as published in
 | `ios-arm64` | 32.1 MiB (33 655 768 B) | 352.3 MiB | **66.2 MiB** |
 | `linux-x64` | 47.3 MiB (49 588 622 B) | 926.3 MiB | **186.7 MiB** |
 | `android-arm64` | 51.4 MiB (53 946 302 B) | 857.6 MiB | **191.9 MiB** |
-| `win-x64` | not built yet | | |
+| `win-x64` | 76.8 MiB (80 484 140 B), as `webrtc.lib` | 411.1 MiB | **158.4 MiB** (`.zip`) |
+
+`win-x64` is the outlier in both columns, in opposite directions. Its library is
+the largest — a COFF archive of 2 935 objects, where `mac-arm64`'s is 2 923 in
+about half the bytes, because MSVC-mangled names are long and `/Zc:inline` still
+leaves more in an unstripped `.lib` than `symbol_level=0` does in a Mach-O `.a`.
+Its *bundle* is nonetheless smaller than Linux's, because it carries no sysroot:
+Microsoft's headers stay on the consumer's machine, exactly as Apple's do. And
+`.zip`/deflate is a weaker compressor than `xz`, so 411 MiB uncompressed lands
+at 158 MiB where Linux's 926 MiB reaches 187 MiB.
 
 > The Linux and Android bundles are larger than the Apple ones, because they
 > also carry a sysroot — a Debian bullseye sysroot on Linux (166.0 MiB), the
@@ -138,7 +147,7 @@ Per target, as published in
 > fatter than they need to be; the next pin bump will produce smaller ones.
 
 The largest single component is the clang/lld toolchain: 260.6 MiB on macOS,
-448.9 MiB on Linux. It is bundled rather than fetched from Google because a
+274.1 MiB on Windows, 448.9 MiB on Linux. It is bundled rather than fetched from Google because a
 second network dependency is a second thing that can be unavailable, and
 because 450 MiB next to a 33 GB checkout is not the problem worth solving.
 
@@ -175,6 +184,21 @@ reproduces those figures and adds what it costs to package:
 So the cost of publishing is about two minutes on top of a build that had to
 happen anyway — and it is paid once per pin instead of once per contributor.
 
+`win-x64`, from run
+[31690243280](https://github.com/veilnetwork/libwebrtc-builds/actions/runs/31690243280),
+one hour two minutes end to end:
+
+| Step | win-x64 |
+|---|---|
+| reclaim disk | 5m 03s |
+| `depot_tools` clone + bootstrap | 11s |
+| `fetch` + `gclient sync` | 30m 47s |
+| `gn gen` | 12s |
+| `ninja -C out/win-x64 webrtc` | 24m 34s |
+| package the bundle | 15s |
+| compress (`7z -tzip -mx=6`) | 20s |
+| **verify: build `veil_media.dll` from the bundle, checkout hidden** | **20s** |
+
 **Demonstrated**, not projected. On 2026-08-13 the `mac-arm64` bundle was cut
 from a local checkout, compressed to the asset that is published, extracted
 into an empty directory, and the 33 GB checkout was **renamed out of the way**
@@ -194,6 +218,26 @@ The round trip matters as much as the build: a bundle tested in its staging
 directory can pass on file modes and symlinks that a tar does not carry. This
 one was tested after `tar | xz` and extraction, and `clang++ -> clang`,
 `ld.lld -> lld` and the executable bits all survive.
+
+`win-x64` was proved the same way in CI, and with one extra thing taken away.
+`verify-sdk.ps1` renames `C:\webrtc` aside **and clears `INCLUDE`** before the
+wrapper build, because `clang-cl` reads that variable for system headers: a
+runner already exporting a Visual Studio `INCLUDE` would compile the bundle
+whether or not `setup.ps1` had repointed a single path, and pass for a reason
+the bundle had no part in. It was `(unset)` in the run, so the nine repointed
+`-imsvc` paths are what made the compile work:
+
+```
+==> INCLUDE was: (unset)
+==> hid C:\webrtc - the bundle is now the only WebRTC on this machine
+  -imsvc -> 9 local paths, from C:\Program Files\Microsoft Visual Studio\18\…\include
+==> done: veil_media.dll (5.5 MB)
+exported veil_media_* symbols: 87
+==> VERIFIED: the bundle alone builds the wrapper in 20s
+```
+
+Twenty seconds, all eight Windows translation units, all 87 `veil_media_*`
+exports — against roughly fifty-five minutes of `sync` plus `ninja`.
 
 ---
 
@@ -374,7 +418,17 @@ at the Visual Studio and Windows SDK installed here — found through `vswhere`
 and `Installed Roots`, because the version directories differ per machine.
 A Windows consumer therefore needs Visual Studio with the C++ toolchain, the
 way a macOS consumer needs Xcode. The link additionally reads `LIB` for
-Microsoft's import libraries, which a Developer PowerShell already sets.
+Microsoft's import libraries, which a Developer PowerShell already sets;
+`verify-sdk.ps1` builds the same list from `vswhere` when it is unset, which it
+was on the runner.
+
+One more thing the Windows bundle does not carry, and neither does the checkout
+it was cut from: **`llvm-nm.exe`**. WebRTC's `third_party/llvm-build` ships
+`clang-cl`, `lld-link`, `llvm-ml`, `llvm-pdbutil`, `llvm-symbolizer` and
+`llvm-undname` on Windows, and no `llvm-nm`. The wrapper build uses it to
+generate the export `.def`, and falls back to whatever `llvm-nm.exe` is on
+`PATH` — a GitHub runner has one, a developer machine may not. The bundle is no
+worse off than a 33 GB checkout here, but it is not better either.
 
 **Why macOS and iOS are packed locally rather than in CI.** The checkout is
 ~33 GB (measured). The Linux and Windows runners only fit it after an explicit
