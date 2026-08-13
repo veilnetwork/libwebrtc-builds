@@ -1,0 +1,20 @@
+# The single source of truth for what this repository builds.
+#
+# Sourced by scripts/*.sh and appended to $GITHUB_ENV by the workflow, so a
+# bump happens in one place and every job, script and manifest agrees.
+#
+# WEBRTC_PIN is not a version, it is a commit in Google's own repository.
+# It is bumped deliberately: the veil wrapper calls WebRTC APIs whose
+# signatures move between revisions (SendRtp's span, DeliverRtpPacket's
+# arity), so a different pin does not fail to link — it fails to compile,
+# later, in a way that reads like the wrapper is wrong.
+WEBRTC_PIN=4ef980bc2c70834276c791e71e7834b8809f24ad
+
+# depot_tools ships auto-updating build tooling that runs with full
+# permissions in the build job. Unpinned, every run executes whatever was
+# pushed to its main that day, and a compromise upstream lands straight in
+# the artifacts published here. Bump this deliberately too.
+DEPOT_TOOLS_PIN=e154c8eda5e63cbe85a765ae9d06e2b7af05139e
+
+# Bumped when the bundle layout changes in a way a consumer must notice.
+SDK_SCHEMA=1

@@ -1,0 +1,389 @@
+name: build
+
+# Build WebRTC once, here, so that nobody building the veil_media wrapper has
+# to build it again.
+#
+# The expensive half of a veil_media build is not the wrapper. Measured on the
+# xVeil webrtc-linux workflow, run 31609030118:
+#
+#     gclient sync (the checkout)   24m30s      linux-x64
+#     ninja -C out/linux-x64 webrtc 13m26s
+#     build_veil_media_so_linux.sh     18s   <- the wrapper. eighteen seconds.
+#
+# and roughly 33 GB on disk for the checkout. This workflow pays that once per
+# WebRTC pin and publishes the result, so the wrapper build becomes a download
+# and a ten-second compile on any machine.
+#
+# It is a BUILD repository, not a fork of WebRTC. WebRTC cannot usefully be
+# forked: `fetch webrtc` resolves a dependency tree of ~63 git repositories and
+# ~53 cipd packages from Google's own infrastructure, and the read-only GitHub
+# mirror (webrtc-mirror/webrtc) does not even contain the commit this project
+# pins. See the README.
+
+on:
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: 'Space-separated: linux-x64 android-arm64 win-x64'
+        required: false
+        type: string
+        default: 'linux-x64 android-arm64'
+      publish:
+        description: 'Attach the results to the release for this pin'
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------- linux ---
+  # One job shape, two targets. Both need an x86_64 Linux HOST: WebRTC's gn
+  # asserts host_os=="linux" for Android targets and the NDK it downloads is
+  # linux-x86_64 only, so neither a Mac nor an arm64 Linux box can produce the
+  # android bundle. The linux-x64 target has the same host requirement for its
+  # own toolchain.
+  linux:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    if: ${{ contains(inputs.targets, 'linux-x64') || contains(inputs.targets, 'android-arm64') }}
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            gn_args: 'target_os="linux" target_cpu="x64" is_debug=false is_component_build=false symbol_level=0 rtc_include_tests=false rtc_build_examples=false rtc_build_tools=false rtc_enable_protobuf=false rtc_use_h264=false enable_libaom=false rtc_include_opus=true treat_warnings_as_errors=false'
+            gclient_os: ''
+          - target: android-arm64
+            # android_static_analysis="off" is what makes this build FINISH, not
+            # an optimisation. WebRTC's default hands the Java lint/ErrorProne
+            # checks to a daemon that only exists under depot_tools' autoninja,
+            # so under plain ninja every *__validate_deps action dies on
+            # "AUTONINJA_BUILD_ID is not set" after fifteen minutes of real
+            # compiling. Those targets analyse WebRTC's Java SDK; this build
+            # wants libwebrtc.a and neither compiles nor ships that Java.
+            gn_args: 'target_os="android" target_cpu="arm64" is_debug=false is_component_build=false symbol_level=0 rtc_include_tests=false rtc_build_examples=false rtc_build_tools=false rtc_enable_protobuf=false rtc_use_h264=false enable_libaom=false rtc_include_opus=true treat_warnings_as_errors=false android_static_analysis="off"'
+            gclient_os: 'android'
+    env:
+      WEBRTC_ROOT: /home/runner/webrtc
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # One source of truth for both pins, read the same way by every job.
+      - name: Read the pins
+        run: grep -E '^[A-Z_]+=' PIN >> "$GITHUB_ENV"
+
+      - name: Skip targets not asked for
+        id: want
+        run: |
+          if echo "${{ inputs.targets }}" | grep -qw "${{ matrix.target }}"; then
+            echo "run=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=no" >> "$GITHUB_OUTPUT"
+            echo "${{ matrix.target }} was not requested"
+          fi
+
+      # The WebRTC checkout plus its build tree does not fit beside the runner's
+      # preinstalled toolchains, and the failure arrives as a confusing write
+      # error deep inside gclient rather than as "no space".
+      - name: Reclaim disk
+        if: steps.want.outputs.run == 'yes'
+        run: |
+          echo "before:"; df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /usr/local/share/powershell \
+                      /usr/local/lib/node_modules "${AGENT_TOOLSDIRECTORY:-}" || true
+          sudo apt-get clean
+          echo "after:"; df -h / | tail -1
+
+      # PINNED. depot_tools ships auto-updating build tooling that runs with
+      # full permissions in this job; off HEAD, every run executes whatever was
+      # pushed to main that day and a compromise upstream lands straight in the
+      # assets published here.
+      - name: depot_tools
+        if: steps.want.outputs.run == 'yes'
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none \
+            https://chromium.googlesource.com/chromium/tools/depot_tools.git \
+            "$HOME/depot_tools"
+          git -C "$HOME/depot_tools" checkout --detach "$DEPOT_TOOLS_PIN"
+          # Bootstrap the pinned checkout's own vpython3 + cipd binaries.
+          # `gclient` brings them up on first use; `gn` does not, and its
+          # wrapper then dies with "python3_bin_reldir.txt not found" — after
+          # twenty-five minutes of syncing. It has to run BEFORE the line below,
+          # because GITHUB_ENV applies to later steps, so DEPOT_TOOLS_UPDATE is
+          # still unset here and the bootstrap may fetch what the pin asks for.
+          "$HOME/depot_tools/ensure_bootstrap"
+          echo "DEPOT_TOOLS_UPDATE=0" >> "$GITHUB_ENV"
+          echo "$HOME/depot_tools" >> "$GITHUB_PATH"
+
+      # target_os has to be in .gclient BEFORE the sync, or the NDK and the
+      # android sysroot are never fetched and gn fails later on a missing
+      # toolchain rather than on the thing that is actually wrong.
+      - name: WebRTC at the pinned commit
+        if: steps.want.outputs.run == 'yes'
+        run: |
+          set -euo pipefail
+          mkdir -p "$WEBRTC_ROOT"
+          cd "$WEBRTC_ROOT"
+          fetch --nohooks webrtc
+          if [ -n "${{ matrix.gclient_os }}" ]; then
+            grep -q "target_os" .gclient || echo "target_os = ['${{ matrix.gclient_os }}']" >> .gclient
+          fi
+          cd src
+          git checkout "$WEBRTC_PIN"
+          # Transient 429s from the Google mirrors are normal under load.
+          ok=0
+          for attempt in 1 2 3 4 5 6; do
+            echo "sync attempt $attempt"
+            if gclient sync --with_branch_heads --reset --jobs 4; then ok=1; break; fi
+            sleep $((attempt * 20))
+          done
+          [ "$ok" = 1 ] || { echo "::error::gclient sync failed after 6 attempts"; exit 1; }
+
+      # --export-compile-commands is not decoration and is the reason this
+      # repository can exist: the wrapper build reads call.cc's exact command
+      # out of compile_commands.json and swaps only the source file, so the
+      # bundle carries that command rather than reinventing two dozen flags.
+      - name: Build libwebrtc.a
+        if: steps.want.outputs.run == 'yes'
+        run: |
+          set -euo pipefail
+          cd "$WEBRTC_ROOT/src"
+          gn gen "out/${{ matrix.target }}" --export-compile-commands --args='${{ matrix.gn_args }}'
+          test -f "out/${{ matrix.target }}/compile_commands.json" \
+            || { echo "::error::gn produced no compile_commands.json — the bundle is built out of it"; exit 1; }
+          ninja -C "out/${{ matrix.target }}" webrtc
+          ls -la "out/${{ matrix.target }}/obj/libwebrtc.a"
+
+      - name: Package the SDK bundle
+        if: steps.want.outputs.run == 'yes'
+        run: |
+          set -euo pipefail
+          python3 scripts/pack_sdk.py \
+            --src "$WEBRTC_ROOT/src" \
+            --out "out/${{ matrix.target }}" \
+            --target "${{ matrix.target }}" \
+            --dest "$RUNNER_TEMP/veil-webrtc-sdk-${{ matrix.target }}" \
+            --webrtc-pin "$WEBRTC_PIN" \
+            --depot-tools-pin "$DEPOT_TOOLS_PIN" \
+            --schema "$SDK_SCHEMA" \
+            --built-by "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+      # The claim being tested is "this bundle alone builds the wrapper", so the
+      # checkout it was cut from is renamed away first. Verified beside that
+      # checkout the test would pass for a reason nobody else's machine has:
+      # every include path in the command is relative, so a header the bundle
+      # forgot resolves against the original tree.
+      - name: The bundle alone builds the wrapper
+        if: steps.want.outputs.run == 'yes'
+        run: |
+          set -euo pipefail
+          # patchelf writes DT_NEEDED libveilclient_ffi.so. The wrapper script
+          # only WARNS when it is missing and then produces a .so that fails at
+          # load instead of here.
+          sudo apt-get update && sudo apt-get install -y patchelf
+          git clone --depth 1 https://github.com/veilnetwork/veil.git "$RUNNER_TEMP/veil"
+          echo "veil at $(git -C "$RUNNER_TEMP/veil" rev-parse HEAD)"
+          bash scripts/verify-sdk.sh \
+            --bundle "$RUNNER_TEMP/veil-webrtc-sdk-${{ matrix.target }}" \
+            --target "${{ matrix.target }}" \
+            --veil "$RUNNER_TEMP/veil" \
+            --hide "$WEBRTC_ROOT" \
+            --dest "$RUNNER_TEMP/engine-out"
+
+      - name: Compress
+        if: steps.want.outputs.run == 'yes'
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/assets"
+          cd "$RUNNER_TEMP"
+          tar -C "$RUNNER_TEMP" -cf - "veil-webrtc-sdk-${{ matrix.target }}" \
+            | xz -T0 -6 > "assets/veil-webrtc-sdk-${{ matrix.target }}.tar.xz"
+          # The raw archive on its own, for inspection and for anyone who wants
+          # only the library. It is NOT enough to build the wrapper — see the
+          # README — but publishing it is cheap and it is what the repository
+          # is named after.
+          cp "veil-webrtc-sdk-${{ matrix.target }}/src/out/${{ matrix.target }}/obj/libwebrtc.a" \
+             "assets/libwebrtc-${{ matrix.target }}.a"
+          # The manifest as its own small asset: a consumer checking that its
+          # pin matches the published one should not have to download 150 MB
+          # to read one field.
+          cp "veil-webrtc-sdk-${{ matrix.target }}/veil-webrtc-sdk.json" \
+             "assets/veil-webrtc-sdk-${{ matrix.target }}.json"
+          ls -la assets/
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: steps.want.outputs.run == 'yes'
+        with:
+          name: sdk-${{ matrix.target }}
+          path: ${{ runner.temp }}/assets/*
+          if-no-files-found: error
+
+  # -------------------------------------------------------------- windows ---
+  # A Windows HOST is required for the win-x64 toolchain and the Media
+  # Foundation headers. DEPOT_TOOLS_WIN_TOOLCHAIN=0 is not optional: without it
+  # depot_tools tries to fetch Google's internal Visual Studio package and fails
+  # with an access error that reads like a network problem.
+  windows:
+    name: win-x64
+    runs-on: windows-latest
+    if: ${{ contains(inputs.targets, 'win-x64') }}
+    timeout-minutes: 350
+    env:
+      WEBRTC_ROOT: 'C:\webrtc'
+      DEPOT_TOOLS_WIN_TOOLCHAIN: '0'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Read the pins
+        shell: bash
+        run: grep -E '^[A-Z_]+=' PIN >> "$GITHUB_ENV"
+
+      - name: Reclaim disk
+        shell: pwsh
+        run: |
+          Get-PSDrive C | Select-Object Used, Free
+          foreach ($path in @(
+            "$env:ProgramFiles\dotnet\sdk",
+            "${env:ProgramFiles(x86)}\Android",
+            "$env:AGENT_TOOLSDIRECTORY\Ruby",
+            "$env:AGENT_TOOLSDIRECTORY\go",
+            "$env:AGENT_TOOLSDIRECTORY\CodeQL"
+          )) {
+            if (Test-Path $path) { Remove-Item -Recurse -Force $path -ErrorAction SilentlyContinue }
+          }
+          Get-PSDrive C | Select-Object Used, Free
+
+      - name: depot_tools
+        shell: pwsh
+        run: |
+          git clone --filter=blob:none https://chromium.googlesource.com/chromium/tools/depot_tools.git C:\depot_tools
+          git -C C:\depot_tools checkout --detach $env:DEPOT_TOOLS_PIN
+          "DEPOT_TOOLS_UPDATE=0" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "C:\depot_tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: WebRTC at the pinned commit
+        shell: cmd
+        run: |
+          mkdir %WEBRTC_ROOT%
+          cd /d %WEBRTC_ROOT%
+          call fetch --nohooks webrtc || exit /b 1
+          cd src
+          call git checkout %WEBRTC_PIN% || exit /b 1
+          for /L %%a in (1,1,6) do (
+            echo sync attempt %%a
+            call gclient sync --with_branch_heads --reset --jobs 4 && goto :synced
+            timeout /t 30 /nobreak > nul
+          )
+          echo ::error::gclient sync failed after 6 attempts
+          exit /b 1
+          :synced
+          echo sync complete
+
+      - name: Build webrtc.lib
+        shell: cmd
+        run: |
+          cd /d %WEBRTC_ROOT%\src
+          call gn gen out/win-x64 --export-compile-commands --args="target_os=\"win\" target_cpu=\"x64\" is_debug=false is_component_build=false symbol_level=0 rtc_include_tests=false rtc_build_examples=false rtc_build_tools=false rtc_enable_protobuf=false rtc_use_h264=false enable_libaom=false rtc_include_opus=true treat_warnings_as_errors=false" || exit /b 1
+          if not exist out\win-x64\compile_commands.json (
+            echo ::error::gn produced no compile_commands.json - the bundle is built out of it
+            exit /b 1
+          )
+          call ninja -C out/win-x64 webrtc || exit /b 1
+          dir out\win-x64\obj\webrtc.lib
+
+      - name: Package the SDK bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/pack_sdk.py \
+            --src "/c/webrtc/src" \
+            --out "out/win-x64" \
+            --target win-x64 \
+            --dest "$RUNNER_TEMP/veil-webrtc-sdk-win-x64" \
+            --webrtc-pin "$WEBRTC_PIN" \
+            --depot-tools-pin "$DEPOT_TOOLS_PIN" \
+            --schema "$SDK_SCHEMA" \
+            --built-by "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+      # Zip rather than tar.xz on this one target: PowerShell's Expand-Archive
+      # reads it with no question, and whether the bundled tar.exe was built
+      # with liblzma is not something to discover on a consumer's machine.
+      - name: Compress
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\assets" | Out-Null
+          Compress-Archive -Path "$env:RUNNER_TEMP\veil-webrtc-sdk-win-x64" `
+            -DestinationPath "$env:RUNNER_TEMP\assets\veil-webrtc-sdk-win-x64.zip"
+          Copy-Item "$env:RUNNER_TEMP\veil-webrtc-sdk-win-x64\src\out\win-x64\obj\webrtc.lib" `
+            "$env:RUNNER_TEMP\assets\webrtc-win-x64.lib"
+          Copy-Item "$env:RUNNER_TEMP\veil-webrtc-sdk-win-x64\veil-webrtc-sdk.json" `
+            "$env:RUNNER_TEMP\assets\veil-webrtc-sdk-win-x64.json"
+          Get-ChildItem "$env:RUNNER_TEMP\assets"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sdk-win-x64
+          path: ${{ runner.temp }}/assets/*
+          if-no-files-found: error
+
+  # -------------------------------------------------------------- publish ---
+  # The only job that can write. It compiles nothing and downloads nothing from
+  # the network beyond the run's own artifacts, so the token with write access
+  # is never in the same job as a build that executes third-party code.
+  publish:
+    name: publish
+    needs: [linux, windows]
+    if: ${{ !cancelled() && inputs.publish && (needs.linux.result == 'success' || needs.windows.result == 'success') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Read the pins
+        run: grep -E '^[A-Z_]+=' PIN >> "$GITHUB_ENV"
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: assets
+          pattern: sdk-*
+          merge-multiple: true
+
+      - name: What is about to be published
+        run: |
+          set -euo pipefail
+          ls -la assets/
+          # A publish step that finds nothing to publish must fail, not succeed
+          # quietly with an empty release.
+          [ -n "$(ls -A assets/)" ] || { echo "::error::no assets were produced"; exit 1; }
+          for m in assets/*.json; do echo "--- $m"; cat "$m"; done
+
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: webrtc-${{ env.WEBRTC_PIN }}
+          name: WebRTC ${{ env.WEBRTC_PIN }}
+          body: |
+            Prebuilt WebRTC for the `veil_media` call engine, at WebRTC commit
+            `${{ env.WEBRTC_PIN }}` (depot_tools `${{ env.DEPOT_TOOLS_PIN }}`).
+
+            `veil-webrtc-sdk-<target>.tar.xz` is the bundle to use: extract it,
+            run `./setup.sh`, then point the wrapper build at it. Each bundle was
+            verified in this run by building the wrapper against it **with the
+            WebRTC checkout renamed away**, so it is self-contained by test and
+            not by inspection.
+
+            `libwebrtc-<target>.a` is the static library alone. It is published
+            because it is what this repository is named after, but on its own it
+            is not enough to build the wrapper — see the README.
+
+            `veil-webrtc-sdk-<target>.json` is the manifest, published separately
+            so a pin check does not have to download the bundle.
+
+            Built by ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          files: assets/*
+          fail_on_unmatched_files: true
