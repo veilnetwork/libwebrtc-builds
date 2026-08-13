@@ -248,13 +248,33 @@ check the pin, download, verify the archive's checksum, run `setup.sh` — and
 prints the variables the wrapper build wants:
 
 ```sh
-eval "$(curl -fsSL https://raw.githubusercontent.com/veilnetwork/libwebrtc-builds/main/scripts/fetch-sdk.sh \
-        | bash -s -- --target linux-x64 --expect-pin 4ef980bc2c70834276c791e71e7834b8809f24ad)"
+curl -fsSL -o fetch-sdk.sh \
+  https://raw.githubusercontent.com/veilnetwork/libwebrtc-builds/main/scripts/fetch-sdk.sh
+bash fetch-sdk.sh --target linux-x64 \
+  --expect-pin 4ef980bc2c70834276c791e71e7834b8809f24ad > sdk-env.sh
+. ./sdk-env.sh
 
 bash third_party/veil/flutter/veil_media/linux/build_veil_media_so_linux.sh
 ```
 
 `--expect-pin` is required, not optional: see "Detecting a mismatch" below.
+
+**Run it, then source it — not `eval "$(fetch-sdk.sh …)"`.** This file taught
+the `eval` form until xVeil's CI was written against it, and the `eval` form
+throws away the exact failure the pin check exists to raise. `eval` reports the
+status of what it *evaluates*, not of the command substitution that fed it: a
+refusal prints its reason to stderr and nothing to stdout, `eval ""` succeeds,
+and `set -e` sees a clean run. The variables are then simply unset, so the build
+below falls back to whatever `WEBRTC_SRC` defaults to — a stale checkout, or the
+compiled-in path — and compiles happily against the wrong WebRTC. Demonstrated,
+not reasoned: under `set -euo pipefail`, a deliberately wrong `--expect-pin`
+exits 0 with `WEBRTC_SRC` unset. Keeping the script and its output as two steps
+means the refusal is the shell's own non-zero status.
+
+Pin the script by commit sha rather than `main` wherever the caller is
+automated. This is code from another repository executing in your job; a sha is
+immutable, `main` is whatever was pushed this morning. xVeil does exactly that
+(`VEIL_SDK_SCRIPT_PIN` in its `webrtc-*.yml`).
 
 By hand, if you prefer:
 
