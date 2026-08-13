@@ -354,6 +354,28 @@ The fix is the Windows twin of what the linux job already does with
 top of the sync step too — resolving the exact name `CreateProcess` will look
 for costs a second, where being told by a traceback costs twenty-five minutes.
 
+**What the Windows bundle does not carry.** Microsoft's headers, for the same
+reason the Apple bundles do not carry Apple's: they are not ours to
+redistribute. Windows names them with `-imsvc` rather than a sysroot, and `gn`
+writes those paths *relative to the build directory*, climbing out of the
+checkout to reach them:
+
+```
+-imsvc../../../../Program Files/Microsoft Visual Studio/18/Enterprise/VC/Tools/MSVC/14.51.36231/include
+```
+
+Four levels up from `C:/webrtc/src/out/win-x64` is the drive root, so that
+resolves on the machine that built it. Four levels up from
+`…/veil-webrtc-sdk-win-x64/src/out/win-x64` is wherever the bundle was
+extracted, and `clang-cl` then looks for the Windows SDK inside it. So
+`pack_sdk.py` makes every `-imsvc` that resolves outside the checkout absolute,
+records them in the manifest as `msvc_includes`, and `setup.ps1` repoints them
+at the Visual Studio and Windows SDK installed here — found through `vswhere`
+and `Installed Roots`, because the version directories differ per machine.
+A Windows consumer therefore needs Visual Studio with the C++ toolchain, the
+way a macOS consumer needs Xcode. The link additionally reads `LIB` for
+Microsoft's import libraries, which a Developer PowerShell already sets.
+
 **Why macOS and iOS are packed locally rather than in CI.** The checkout is
 ~33 GB (measured). The Linux and Windows runners only fit it after an explicit
 "Reclaim disk" step that deletes preinstalled SDKs; GitHub-hosted macOS runners

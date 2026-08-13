@@ -56,6 +56,49 @@ try {
   $env:WEBRTC_SRC = Join-Path $Bundle 'src'
   $env:WEBRTC_OUT = "out\$Target"
 
+  # What the machine was already offering, before any of it is taken away.
+  Write-Host "==> INCLUDE was: $(if ($env:INCLUDE) { $env:INCLUDE } else { '(unset)' })"
+  Write-Host "==> LIB was:     $(if ($env:LIB) { $env:LIB } else { '(unset)' })"
+
+  # Clearing INCLUDE is the same idea as hiding the checkout. clang-cl reads it
+  # for system headers, and a runner that already exports a Visual Studio
+  # INCLUDE would compile this bundle whether or not setup.ps1 repointed a
+  # single -imsvc path - green for a reason the bundle had nothing to do with.
+  # LIB stays: the LINK needs Microsoft's import libraries by bare name, and
+  # nothing in the bundle claims to provide those.
+  $env:INCLUDE = ''
+  if (-not $env:LIB) {
+    # No developer environment here. Build the same list a developer prompt
+    # would set, so the link failing means the link is wrong rather than that
+    # this happened to run in a bare shell.
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (Test-Path $vswhere) {
+      $vs = & $vswhere -latest -products * -property installationPath 2>$null | Select-Object -First 1
+      $tools = $null
+      if ($vs) {
+        $tools = Get-ChildItem (Join-Path $vs 'VC\Tools\MSVC') -Directory -ErrorAction SilentlyContinue |
+          Sort-Object Name -Descending | Select-Object -First 1
+      }
+      $kits = (Get-ItemProperty 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows Kits\Installed Roots' -ErrorAction SilentlyContinue).KitsRoot10
+      $libs = @()
+      if ($tools) { $libs += (Join-Path $tools.FullName 'lib\x64') }
+      if ($kits) {
+        $sdk = Get-ChildItem (Join-Path $kits 'Lib') -Directory -ErrorAction SilentlyContinue |
+          Where-Object { $_.Name -like '10.*' } | Sort-Object Name -Descending | Select-Object -First 1
+        if ($sdk) {
+          foreach ($part in @('um\x64', 'ucrt\x64')) {
+            $p = Join-Path $sdk.FullName $part
+            if (Test-Path $p) { $libs += $p }
+          }
+        }
+      }
+      if ($libs) {
+        $env:LIB = $libs -join ';'
+        Write-Host "==> LIB set to: $env:LIB"
+      }
+    }
+  }
+
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
   & $builder -WebrtcSrc $env:WEBRTC_SRC -WebrtcOut $env:WEBRTC_OUT -Dest $Dest
   if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) { throw "the wrapper build exited $LASTEXITCODE" }

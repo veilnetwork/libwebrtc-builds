@@ -237,6 +237,50 @@ def find_sysroot(cmd: str) -> str | None:
     return None
 
 
+# Every -imsvc in the command, quoted or bare. WebRTC quotes them, because the
+# paths have spaces in them.
+IMSVC_RE = re.compile(r'"-imsvc([^"]+)"|-imsvc(\S+)')
+
+
+def absolutize_external_msvc(cmd: str, directory: str, src: str):
+    """Point the Windows toolchain includes at where they REALLY are.
+
+    gn writes them relative to the build directory, and they climb out of the
+    checkout to reach Microsoft's own headers:
+
+        -imsvc../../../../Program Files/Microsoft Visual Studio/…/include
+
+    Four levels up from `C:/webrtc/src/out/win-x64` is the drive root, so that
+    resolves on the build machine. In a bundle it does not: four levels up from
+    `…/veil-webrtc-sdk-win-x64/src/out/win-x64` is the extraction directory, and
+    clang-cl then looks for the Windows SDK inside it, finds nothing, and says
+    so as a wall of missing <windows.h> rather than as a bad path.
+
+    So anything that resolves OUTSIDE the checkout is made absolute here, and
+    setup.ps1 repoints it at the consumer's own Visual Studio. Anything inside
+    the checkout is left relative, because that is what makes the bundle
+    relocatable at all.
+    """
+    external: "list[str]" = []
+
+    def repl(m: "re.Match") -> str:
+        path = m.group(1) or m.group(2)
+        cand = path if os.path.isabs(path) else os.path.normpath(
+            os.path.join(directory, path))
+        try:
+            inside = (os.path.realpath(cand)
+                      .startswith(os.path.realpath(src) + os.sep))
+        except OSError:
+            inside = False
+        if inside:
+            return m.group(0)
+        fwd = cand.replace("\\", "/")
+        external.append(fwd)
+        return '"-imsvc%s"' % fwd
+
+    return IMSVC_RE.sub(repl, cmd), external
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", required=True, help="the WebRTC src/ directory")
@@ -266,6 +310,10 @@ def main() -> int:
 
     entry = load_template(cc_json)
     cmd = command_of(entry)
+    msvc_includes: "list[str]" = []
+    if windows:
+        cmd, msvc_includes = absolutize_external_msvc(
+            cmd, entry["directory"], src)
 
     stage = os.path.abspath(args.dest)
     if os.path.exists(stage):
@@ -349,6 +397,18 @@ def main() -> int:
             log(f"==> sysroot is outside the checkout ({sysroot_rel}) — setup.sh will "
                 f"point it at the local SDK")
 
+    if windows and msvc_includes:
+        # Windows names no sysroot at all: the platform headers arrive as
+        # -imsvc paths into the installed Visual Studio and Windows SDK. Say
+        # that, rather than leaving the field reading "none (host toolchain)"
+        # as though the command carried everything it needs.
+        sysroot_note = ("external: Visual Studio + Windows SDK, named by "
+                        "-imsvc and repointed by setup.ps1")
+        log(f"==> {len(msvc_includes)} toolchain include paths point outside "
+            f"the checkout; made absolute, setup.ps1 will repoint them")
+        for p in msvc_includes:
+            log(f"    {p}")
+
     # `-MMD -MF obj/call/call/call.o.d` survives into every veil TU, because the
     # build scripts rewrite the source and `-o` and nothing else. clang creates
     # the .d file but NOT its directory, so without this the first compile in a
@@ -358,10 +418,21 @@ def main() -> int:
     # A one-entry compile_commands.json with every absolute path replaced by a
     # token. setup.sh substitutes the real extraction path back in.
     token = "@VEIL_SDK_SRC@"
+
+    def tokenize(s: str) -> str:
+        return s.replace(src, token).replace(src.replace("\\", "/"), token)
+
+    # "file" gets the SAME treatment as the command, rather than being rebuilt
+    # from the token, because the two have to agree. gn writes the source
+    # relative on Windows (`../../call/call.cc`) and the wrapper build there
+    # swaps the source by matching this field against the command verbatim: a
+    # rebuilt absolute "file" matches nothing, so nothing is swapped, and
+    # clang-cl is handed a call.cc that is not where the bundle put it —
+    # "no such file or directory: '../../call/call.cc'", run 31684359087.
     tmpl = {
         "directory": token + "/" + args.out.replace("\\", "/"),
-        "command": cmd.replace(src, token).replace(src.replace("\\", "/"), token),
-        "file": token + "/call/call.cc",
+        "command": tokenize(cmd),
+        "file": tokenize(entry.get("file") or (token + "/call/call.cc")),
     }
     with open(os.path.join(stage, "compile_commands.json.in"), "w") as fh:
         json.dump([tmpl], fh, indent=1)
@@ -397,6 +468,12 @@ def main() -> int:
         "libwebrtc_sha256": sha.hexdigest(),
         "out_dir": args.out.replace("\\", "/"),
         "sysroot": sysroot_note,
+        # Windows has no sysroot in the command; it names Microsoft's own
+        # headers with -imsvc instead. Recorded so a consumer can see what the
+        # bundle was built against before setup.ps1 repoints them at whatever
+        # Visual Studio is installed here — the same deal macOS gets, where the
+        # SDK is the host's and not ours to redistribute.
+        "msvc_includes": msvc_includes,
         "bundle_bytes_uncompressed": total,
         "components": {k: {"files": v[0], "bytes": v[1]} for k, v in sorted(cp.tally.items())},
         "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -492,27 +569,114 @@ EOF
 SETUP_PS1 = r'''# Point this bundle at the machine it was extracted onto. Run once, after
 # extracting; it is idempotent.
 #
-# All it does is write compile_commands.json from the shipped template, with
-# the extraction path substituted for the token. The veil build scripts read
-# call.cc's command out of that file, so this is the whole of "installing".
+# It writes compile_commands.json from the shipped template with the extraction
+# path substituted for the token, and repoints the Visual Studio / Windows SDK
+# include paths at the ones installed here. The veil build scripts read call.cc's
+# command out of that file, so this is the whole of "installing".
 $ErrorActionPreference = 'Stop'
 $Root = $PSScriptRoot
 $OutDir = '__OUTDIR_WIN__'
 $src = Join-Path $Root 'src'
 
-# Forward slashes throughout. The substituted path lands inside a JSON string
+# Forward slashes throughout. The substituted paths land inside a JSON string
 # and then inside a clang response file, and a backslash is an escape character
 # in both: `src\out\` in a response file is a tab and a form feed.
 $srcFwd = ($src -replace '\\', '/')
 
-$raw = Get-Content -Raw (Join-Path $Root 'compile_commands.json.in')
-$raw = $raw.Replace('@VEIL_SDK_SRC@', $srcFwd)
+# Microsoft's headers are not in this bundle and are not ours to redistribute -
+# the same deal as macOS, where setup.sh repoints -isysroot at the installed
+# Xcode. On Windows they arrive as -imsvc paths, and their version directories
+# (VC\Tools\MSVC\14.51.36231, Windows Kits\10\include\10.0.26100.0) differ from
+# machine to machine, so the recorded ones are replaced with whatever is here.
+function Find-MsvcIncludes {
+  $vs = $null
+  $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+  if (Test-Path $vswhere) {
+    $vs = & $vswhere -latest -products * -property installationPath 2>$null |
+      Select-Object -First 1
+  }
+  if (-not $vs -and $env:VSINSTALLDIR) { $vs = $env:VSINSTALLDIR.TrimEnd('\') }
+  if (-not $vs) { return $null }
+
+  $toolsRoot = Join-Path $vs 'VC\Tools\MSVC'
+  if (-not (Test-Path $toolsRoot)) { return $null }
+  # Newest by name. MSVC version directories sort correctly as strings.
+  $tools = Get-ChildItem $toolsRoot -Directory |
+    Sort-Object Name -Descending | Select-Object -First 1
+  if (-not $tools) { return $null }
+
+  $inc = @((Join-Path $tools.FullName 'include'))
+  foreach ($extra in @((Join-Path $tools.FullName 'ATLMFC\include'),
+                       (Join-Path $vs 'VC\Auxiliary\VS\include'))) {
+    if (Test-Path $extra) { $inc += $extra }
+  }
+
+  $kits = $null
+  foreach ($key in @('HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows Kits\Installed Roots',
+                     'HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots')) {
+    if (Test-Path $key) {
+      $kits = (Get-ItemProperty -Path $key -ErrorAction SilentlyContinue).KitsRoot10
+      if ($kits) { break }
+    }
+  }
+  if (-not $kits) { $kits = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\' }
+  $sdkInc = Join-Path $kits 'Include'
+  if (Test-Path $sdkInc) {
+    $sdk = Get-ChildItem $sdkInc -Directory | Where-Object { $_.Name -like '10.*' } |
+      Sort-Object Name -Descending | Select-Object -First 1
+    if ($sdk) {
+      foreach ($part in @('ucrt', 'um', 'shared', 'winrt', 'cppwinrt')) {
+        $p = Join-Path $sdk.FullName $part
+        if (Test-Path $p) { $inc += $p }
+      }
+    }
+  }
+  $netfxRoot = Join-Path (Split-Path -Parent $kits.TrimEnd('\')) 'NETFXSDK'
+  if (Test-Path $netfxRoot) {
+    $netfx = Get-ChildItem $netfxRoot -Directory |
+      Sort-Object Name -Descending | Select-Object -First 1
+    if ($netfx) {
+      $p = Join-Path $netfx.FullName 'include\um'
+      if (Test-Path $p) { $inc += $p }
+    }
+  }
+  return $inc
+}
+
+$entries = @(Get-Content -Raw (Join-Path $Root 'compile_commands.json.in') | ConvertFrom-Json)
+foreach ($e in $entries) {
+  foreach ($k in @('directory', 'command', 'file')) {
+    $e.$k = $e.$k.Replace('@VEIL_SDK_SRC@', $srcFwd)
+  }
+  $recorded = [regex]::Matches($e.command, '"-imsvc[^"]*"')
+  if ($recorded.Count -gt 0) {
+    $local = Find-MsvcIncludes
+    if ($local) {
+      # Strip the recorded ones and append the local ones. Position does not
+      # matter: -imsvc directories go on clang's SYSTEM search list, which is
+      # consulted after every -I regardless of where the flags appeared.
+      $e.command = [regex]::Replace($e.command, '\s*"-imsvc[^"]*"', '')
+      $e.command += ' ' + (($local | ForEach-Object {
+        '"-imsvc' + ($_ -replace '\\', '/') + '"'
+      }) -join ' ')
+      Write-Host "  -imsvc -> $($local.Count) local paths, from $($local[0])"
+    } else {
+      # Loud, because the failure it produces otherwise is a wall of missing
+      # <windows.h> that reads like the wrapper sources are broken.
+      Write-Host "  !! no Visual Studio found here - leaving the recorded include paths alone."
+      Write-Host "     If the compile cannot find <windows.h>, that is why."
+    }
+  }
+}
 
 $dest = Join-Path (Join-Path $src $OutDir) 'compile_commands.json'
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dest) | Out-Null
+# Built by hand rather than with ConvertTo-Json on the array: PowerShell emits a
+# bare object for a one-element array, and compile_commands.json is a list.
+$json = '[' + (($entries | ForEach-Object { $_ | ConvertTo-Json -Depth 5 }) -join ',') + ']'
 # No BOM: this file is read by python, by jq and by PowerShell itself, and one
 # of those three chokes on it.
-[System.IO.File]::WriteAllText($dest, $raw, (New-Object System.Text.UTF8Encoding $false))
+[System.IO.File]::WriteAllText($dest, $json, (New-Object System.Text.UTF8Encoding $false))
 Write-Host "  wrote $dest"
 
 Write-Host ""
