@@ -153,6 +153,21 @@ one was tested after `tar | xz` and extraction, and `clang++ -> clang`,
 
 ## Using a bundle
 
+[`scripts/fetch-sdk.sh`](scripts/fetch-sdk.sh) does the whole consumer side —
+check the pin, download, verify the archive's checksum, run `setup.sh` — and
+prints the variables the wrapper build wants:
+
+```sh
+eval "$(curl -fsSL https://raw.githubusercontent.com/veilnetwork/libwebrtc-builds/main/scripts/fetch-sdk.sh \
+        | bash -s -- --target linux-x64 --expect-pin 4ef980bc2c70834276c791e71e7834b8809f24ad)"
+
+bash third_party/veil/flutter/veil_media/linux/build_veil_media_so_linux.sh
+```
+
+`--expect-pin` is required, not optional: see "Detecting a mismatch" below.
+
+By hand, if you prefer:
+
 ```sh
 tag=webrtc-4ef980bc2c70834276c791e71e7834b8809f24ad
 target=linux-x64
@@ -171,7 +186,10 @@ macOS/iOS, repoints `-isysroot` at the locally installed Xcode SDK, which is
 not ours to redistribute). It is idempotent.
 
 No token is needed. Release assets are public — unlike GitHub *run* artifacts,
-which need credentials to download and expire after the retention window.
+which need credentials to download and expire after the retention window. That
+expiry is not hypothetical for this project: xVeil's `fetch-deps.py` carries a
+whole error path explaining that an engine artifact has expired and cannot be
+recovered.
 
 ---
 
