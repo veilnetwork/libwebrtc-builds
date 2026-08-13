@@ -68,6 +68,39 @@ case "$TARGET" in
   mac-*)
     bash "$MEDIA/macos/build_veil_media_dylib.sh" "$DEST"
     artifact="$DEST/libveil_media.dylib" ;;
+  ios-*)
+    # The iOS script cannot be called as-is: it opens by running `gn gen` and
+    # `autoninja` itself, which is the ~40 minutes and 33 GB this bundle exists
+    # to replace. Everything AFTER that block is reproduced here.
+    #
+    # (Consumer side, described but deliberately not applied here: that script
+    # wants a guard so the gn/ninja block is skipped when WEBRTC_SRC already
+    # points at a bundle. Then this case collapses to calling it.)
+    tmp="$(mktemp -d)"
+    objs=()
+    for tu in veil_media_engine.cc veil_transport_shim.cc veil_avf_adm.mm \
+              veil_avf_camera.mm veil_ios_screen_stub.cc veil_audio_record.cc \
+              veil_audio_play.cc veil_video_note.cc; do
+      o="$tmp/${tu%.*}.o"
+      python3 - "$WEBRTC_SRC/$WEBRTC_OUT/compile_commands.json" \
+               "$MEDIA/src/$tu" "$o" "$MEDIA/src" <<'PY' > "$tmp/tu.sh"
+import json,shlex,sys
+cc=json.load(open(sys.argv[1])); src,out,shimdir=sys.argv[2:5]
+e=next(x for x in cc if x.get('file','').endswith('call/call.cc'))
+args=e.get('arguments') or shlex.split(e['command'])
+args[next(i for i,a in enumerate(args) if a.endswith('call/call.cc'))]=src
+args[args.index('-o')+1]=out
+args[1:1]=['-DVEIL_MEDIA_HAVE_WEBRTC=1','-I'+shimdir]
+if src.endswith('.mm'): args.insert(1,'-fobjc-arc')
+print('cd '+shlex.quote(e['directory']))
+print(' '.join(shlex.quote(a) for a in args))
+PY
+      bash "$tmp/tu.sh" || { echo "::error::$tu did not compile against the bundle"; exit 1; }
+      objs+=("$o")
+    done
+    xcrun libtool -static -o "$DEST/libveil_media.a" "${objs[@]}"
+    xcrun ranlib "$DEST/libveil_media.a"
+    artifact="$DEST/libveil_media.a" ;;
   *)
     echo "::error::verify has no recipe for target $TARGET" >&2; exit 2 ;;
 esac
