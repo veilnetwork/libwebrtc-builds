@@ -82,6 +82,12 @@ So each release carries three things per target:
 | `libwebrtc-<target>.a` | the static library alone — for inspection, or for a consumer that already has a toolchain. Not sufficient by itself |
 | `veil-webrtc-sdk-<target>.json` | the manifest, published separately so a pin check does not have to download the bundle |
 
+Windows spells the first two differently, because the platform does:
+`veil-webrtc-sdk-win-x64.**zip**` (PowerShell's `Expand-Archive` reads it with no
+question, where whether the bundled `tar.exe` was built with liblzma is not
+something to discover on a consumer's machine) and `webrtc-win-x64.**lib**`. The
+Windows bundle also carries `setup.ps1` beside `setup.sh` — see "Using a bundle".
+
 ### Measured sizes
 
 From the `mac-arm64` bundle cut on 2026-08-13 (the one target with an existing
@@ -225,6 +231,15 @@ WEBRTC_SRC="$PWD/veil-webrtc-sdk-$target/src" WEBRTC_OUT="out/$target" \
 macOS/iOS, repoints `-isysroot` at the locally installed Xcode SDK, which is
 not ours to redistribute). It is idempotent.
 
+On Windows, run `setup.ps1` instead — it is the same three lines and is not a
+convenience. `setup.sh` resolves its own location with bash's `pwd`, which under
+Git Bash (the only bash a Windows consumer has) is an MSYS path,
+`/c/…/veil-webrtc-sdk-win-x64/src`. `clang-cl` and `lld-link` cannot open those,
+so a Windows bundle set up through `setup.sh` writes a `compile_commands.json`
+naming a directory the compiler never finds — and it says so as a wall of
+missing headers rather than as a bad path. `fetch-sdk.sh` picks the right one
+by target.
+
 No token is needed. Release assets are public — unlike GitHub *run* artifacts,
 which need credentials to download and expire after the retention window. That
 expiry is not hypothetical for this project: xVeil's `fetch-deps.py` carries a
@@ -305,6 +320,40 @@ detectable, which a byte count alone does not.
 | `mac-arm64` | macOS arm64 | by running `scripts/pack_sdk.py` locally, then `gh release upload` |
 | `ios-arm64`, `ios-sim-arm64` | macOS arm64 | same — see below |
 
+**Why the Windows job bootstraps `depot_tools` by hand.** On Windows,
+`depot_tools` does not run `git`. It runs **`git.bat`** — `git_cache.py` opens
+with `git_exe = "git.bat" if sys.platform.startswith("win") else "git"` — and
+`git.bat` is not in the repository. `.gitignore` lists it, because
+`bootstrap/bootstrap.py` *generates* it, as a stub pointed at whatever Git the
+machine already has. Nothing else can stand in for it: `CreateProcess` resolves
+a name that already carries an extension by exact match along `PATH`, so Git for
+Windows' `git.exe` is not a candidate, and `GetCachePath` catches
+`CalledProcessError`, not `FileNotFoundError` — so the miss surfaces raw, as
+`FileNotFoundError: [WinError 2]`, out of `gclient sync`.
+
+Normally `fetch` triggers that generation on the way past: `fetch.bat` calls
+`update_depot_tools.bat`, which ends in `bootstrap\win_tools.bat`. But
+`update_depot_tools.bat` returns at its second test —
+`IF "%DEPOT_TOOLS_UPDATE%" == "0" GOTO :EOF` — several lines *before* that call.
+And this workflow sets `DEPOT_TOOLS_UPDATE=0`, because the lines in between are
+`git fetch origin` and `git checkout origin/main`, which would discard
+`DEPOT_TOOLS_PIN` on every run.
+
+So **pinning `depot_tools` switches its Windows bootstrap off**, and the price
+is only visible six minutes into a sync. That is
+[run 31680937721](https://github.com/veilnetwork/libwebrtc-builds/actions/runs/31680937721).
+The evidence that it is the pin and not the runner image: xVeil's
+`webrtc-windows.yml` built this same target green on 2026-07-31
+(run `30665287484`), and at that commit the workflow had **no `DEPOT_TOOLS_PIN`
+and no `DEPOT_TOOLS_UPDATE=0`** — so `update_depot_tools.bat` ran all the way
+through and generated `git.bat` as a side effect of updating.
+
+The fix is the Windows twin of what the linux job already does with
+`ensure_bootstrap`: call `bootstrap\win_tools.bat` explicitly, then assert
+`git.bat` exists rather than trusting the exit code. `where git.bat` runs at the
+top of the sync step too — resolving the exact name `CreateProcess` will look
+for costs a second, where being told by a traceback costs twenty-five minutes.
+
 **Why macOS and iOS are packed locally rather than in CI.** The checkout is
 ~33 GB (measured). The Linux and Windows runners only fit it after an explicit
 "Reclaim disk" step that deletes preinstalled SDKs; GitHub-hosted macOS runners
@@ -343,6 +392,9 @@ the `veil` repository, not here.
 PIN                        the WebRTC + depot_tools revisions. One source of truth.
 scripts/pack_sdk.py        cut a bundle from a built WebRTC out/ directory
 scripts/verify-sdk.sh      prove a bundle builds the wrapper, checkout hidden
+scripts/verify-sdk.ps1     the same proof for win-x64, whose wrapper build is
+                           a PowerShell script taking PowerShell parameters
+scripts/fetch-sdk.sh       the consumer side: check the pin, download, set up
 .github/workflows/build.yml
 ```
 

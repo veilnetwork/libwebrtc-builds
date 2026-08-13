@@ -90,8 +90,24 @@ else
   echo "==> $name verified ($(wc -c < "$lib" | tr -d ' ') bytes)" >&2
 fi
 
-bash "$BUNDLE/setup.sh" >&2
+# Windows lays the bundle out with setup.ps1, not setup.sh, and the paths it
+# prints are Windows paths. setup.sh resolves its own location with bash's
+# `pwd`, which under Git Bash — the only bash a Windows consumer has — is an
+# MSYS path (/c/…/src) that clang-cl and lld-link cannot open, and the wrapper
+# build for Windows is a PowerShell script that wants a Windows path anyway.
+case "$TARGET" in
+  win-*)
+    WIN_BUNDLE="$(cygpath -w "$BUNDLE" 2>/dev/null || printf '%s' "$BUNDLE")"
+    powershell.exe -NoProfile -ExecutionPolicy Bypass \
+      -File "${WIN_BUNDLE}\\setup.ps1" >&2
+    SRC="${WIN_BUNDLE}\\src"
+    ;;
+  *)
+    bash "$BUNDLE/setup.sh" >&2
+    SRC="$BUNDLE/src"
+    ;;
+esac
 
-echo "export WEBRTC_SRC='$BUNDLE/src'"
+echo "export WEBRTC_SRC='$SRC'"
 echo "export WEBRTC_OUT='$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["out_dir"])' "$manifest")'"
 echo "export WEBRTC_BUILD='$BUNDLE'"

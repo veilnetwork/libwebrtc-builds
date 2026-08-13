@@ -406,7 +406,7 @@ def main() -> int:
         json.dump(manifest, fh, indent=2)
         fh.write("\n")
 
-    write_setup(stage, args.target, args.out, apple)
+    write_setup(stage, args.target, args.out, apple, windows)
 
     log("")
     log("==> bundle composition")
@@ -482,7 +482,50 @@ EOF
 '''
 
 
-def write_setup(stage: str, target: str, outdir: str, apple: bool) -> None:
+# The Windows twin of setup.sh, and it exists because setup.sh cannot do this
+# job on Windows rather than because PowerShell is nicer. setup.sh resolves its
+# own location with bash's `pwd`, which under Git Bash — the only bash a Windows
+# consumer has — is an MSYS path (`/c/…/veil-webrtc-sdk-win-x64/src`). clang-cl
+# and lld-link do not accept those, so a Windows bundle set up through setup.sh
+# writes a compile_commands.json naming a directory the compiler cannot open,
+# and the failure arrives as a missing-header wall rather than as a bad path.
+SETUP_PS1 = r'''# Point this bundle at the machine it was extracted onto. Run once, after
+# extracting; it is idempotent.
+#
+# All it does is write compile_commands.json from the shipped template, with
+# the extraction path substituted for the token. The veil build scripts read
+# call.cc's command out of that file, so this is the whole of "installing".
+$ErrorActionPreference = 'Stop'
+$Root = $PSScriptRoot
+$OutDir = '__OUTDIR_WIN__'
+$src = Join-Path $Root 'src'
+
+# Forward slashes throughout. The substituted path lands inside a JSON string
+# and then inside a clang response file, and a backslash is an escape character
+# in both: `src\out\` in a response file is a tab and a form feed.
+$srcFwd = ($src -replace '\\', '/')
+
+$raw = Get-Content -Raw (Join-Path $Root 'compile_commands.json.in')
+$raw = $raw.Replace('@VEIL_SDK_SRC@', $srcFwd)
+
+$dest = Join-Path (Join-Path $src $OutDir) 'compile_commands.json'
+New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dest) | Out-Null
+# No BOM: this file is read by python, by jq and by PowerShell itself, and one
+# of those three chokes on it.
+[System.IO.File]::WriteAllText($dest, $raw, (New-Object System.Text.UTF8Encoding $false))
+Write-Host "  wrote $dest"
+
+Write-Host ""
+Write-Host "Ready. Build the veil_media wrapper against this bundle with:"
+Write-Host ""
+Write-Host "  <veil>\flutter\veil_media\windows\build_veil_media_dll_windows.ps1 ``"
+Write-Host "    -WebrtcSrc '$src' -WebrtcOut '$OutDir'"
+Write-Host ""
+'''
+
+
+def write_setup(stage: str, target: str, outdir: str, apple: bool,
+                windows: bool = False) -> None:
     body = (SETUP
             .replace("__TARGET__", target)
             .replace("__OUTDIR__", outdir.replace("\\", "/"))
@@ -491,6 +534,15 @@ def write_setup(stage: str, target: str, outdir: str, apple: bool) -> None:
     with open(path, "w") as fh:
         fh.write(body)
     os.chmod(path, 0o755)
+
+    if windows:
+        # CRLF and an explicit encoding: this file is generated on the Windows
+        # runner, where open()'s default is the ANSI code page, and read back by
+        # whichever PowerShell the consumer has.
+        ps1 = SETUP_PS1.replace("__OUTDIR_WIN__", outdir.replace("/", "\\"))
+        with open(os.path.join(stage, "setup.ps1"), "w",
+                  encoding="utf-8", newline="\r\n") as fh:
+            fh.write(ps1)
 
 
 if __name__ == "__main__":
