@@ -24,7 +24,7 @@ on:
   workflow_dispatch:
     inputs:
       targets:
-        description: 'Space-separated: linux-x64 android-arm64 win-x64'
+        description: 'Space-separated: linux-x64 linux-arm64 android-arm64 win-x64 win-arm64'
         required: false
         type: string
         default: 'linux-x64 android-arm64'
@@ -47,7 +47,8 @@ jobs:
   linux:
     name: ${{ matrix.target }}
     runs-on: ubuntu-latest
-    if: ${{ contains(inputs.targets, 'linux-x64') || contains(inputs.targets, 'android-arm64') }}
+    if: ${{ contains(inputs.targets, 'linux-x64') || contains(inputs.targets, 'linux-arm64')
+        || contains(inputs.targets, 'android-arm64') }}
     timeout-minutes: 350
     strategy:
       fail-fast: false
@@ -56,6 +57,18 @@ jobs:
           - target: linux-x64
             gn_args: 'target_os="linux" target_cpu="x64" is_debug=false is_component_build=false symbol_level=0 rtc_include_tests=false rtc_build_examples=false rtc_build_tools=false rtc_enable_protobuf=false rtc_use_h264=false enable_libaom=false rtc_include_opus=true treat_warnings_as_errors=false'
             gclient_os: ''
+            gclient_cpu: ''
+          # Cross-compiled on the x64 host, exactly as android-arm64 already is.
+          # What a Linux cross-build needs ON TOP is the arm64 SYSROOT: the
+          # compiler comes with the checkout, the headers and libraries to link
+          # against do not, and the hooks install only the host's unless
+          # `target_cpu` says otherwise. Declared in .gclient BEFORE the sync for
+          # the same reason `target_os` is — after it, the hook has already run
+          # and the build fails deep in the link with no obvious cause.
+          - target: linux-arm64
+            gn_args: 'target_os="linux" target_cpu="arm64" is_debug=false is_component_build=false symbol_level=0 rtc_include_tests=false rtc_build_examples=false rtc_build_tools=false rtc_enable_protobuf=false rtc_use_h264=false enable_libaom=false rtc_include_opus=true treat_warnings_as_errors=false'
+            gclient_os: ''
+            gclient_cpu: 'arm64'
           - target: android-arm64
             # android_static_analysis="off" is what makes this build FINISH, not
             # an optimisation. WebRTC's default hands the Java lint/ErrorProne
@@ -66,6 +79,7 @@ jobs:
             # wants libwebrtc.a and neither compiles nor ships that Java.
             gn_args: 'target_os="android" target_cpu="arm64" is_debug=false is_component_build=false symbol_level=0 rtc_include_tests=false rtc_build_examples=false rtc_build_tools=false rtc_enable_protobuf=false rtc_use_h264=false enable_libaom=false rtc_include_opus=true treat_warnings_as_errors=false android_static_analysis="off"'
             gclient_os: 'android'
+            gclient_cpu: ''
     env:
       WEBRTC_ROOT: /home/runner/webrtc
     steps:
@@ -133,6 +147,10 @@ jobs:
           if [ -n "${{ matrix.gclient_os }}" ]; then
             grep -q "target_os" .gclient || echo "target_os = ['${{ matrix.gclient_os }}']" >> .gclient
           fi
+          if [ -n "${{ matrix.gclient_cpu }}" ]; then
+            grep -q "target_cpu" .gclient || echo "target_cpu = ['${{ matrix.gclient_cpu }}']" >> .gclient
+          fi
+          cat .gclient
           cd src
           git checkout "$WEBRTC_PIN"
           # Transient 429s from the Google mirrors are normal under load.
@@ -493,10 +511,315 @@ jobs:
   # The only job that can write. It compiles nothing and downloads nothing from
   # the network beyond the run's own artifacts, so the token with write access
   # is never in the same job as a build that executes third-party code.
+
+  # -------------------------------------------------------- windows arm64 ---
+  # A SEPARATE job rather than a matrix over the one above, deliberately. That
+  # job is the only thing producing the Windows SDK today; folding a second
+  # architecture into its cmd blocks and hardcoded out/ paths would put the
+  # working build at risk for a target whose toolchain cannot be confirmed
+  # without running it. Consolidate once this one has succeeded at least once.
+  #
+  # Cross-compiled from the x64 host: the ARM64 cross tools ship as a Visual
+  # Studio COMPONENT, and the step below installs it rather than assuming the
+  # runner image carries it. If a future image does, the install is a no-op.
+  windows-arm64:
+    name: win-arm64
+    runs-on: windows-latest
+    if: ${{ contains(inputs.targets, 'win-arm64') }}
+    timeout-minutes: 350
+    env:
+      WEBRTC_ROOT: 'C:\webrtc-arm64'
+      DEPOT_TOOLS_WIN_TOOLCHAIN: '0'
+      # Staged on C:, not in RUNNER_TEMP. RUNNER_TEMP is on the runner's small
+      # work volume; the checkout, the build tree, the staged bundle and the
+      # zip all have to fit somewhere, and C: is the only drive with room for
+      # them once "Reclaim disk" has run.
+      SDK_STAGE: 'C:\sdk-stage'
+      SDK_ASSETS: 'C:\sdk-assets'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # The ARM64 cross tools are a Visual Studio COMPONENT, not part of the
+      # base install. Without them `gn gen target_cpu="arm64"` succeeds and
+      # ninja dies much later on a missing cl.exe for the target — a failure
+      # that reads like a build error rather than a missing package. Installed
+      # here so the job says so up front; a no-op on an image that has them.
+      - name: ARM64 cross tools
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -property installationPath
+          if (-not $vs) { throw "vswhere found no Visual Studio installation" }
+          $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+          & $installer modify --installPath $vs --quiet --norestart --nocache `
+            --add Microsoft.VisualStudio.Component.VC.Tools.ARM64 `
+            --add Microsoft.VisualStudio.Component.VC.ATL.ARM64 | Out-Null
+          # Assert rather than trust: the installer exits 0 on plenty of
+          # no-ops, and a missing toolchain must fail HERE.
+          $tools = Get-ChildItem "$vs\VC\Tools\MSVC" -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          $cl = Join-Path $tools.FullName 'bin\Hostx64\arm64\cl.exe'
+          if (-not (Test-Path $cl)) { throw "no ARM64 cross compiler at $cl" }
+          Write-Host "ARM64 cl.exe: $cl"
+
+      - name: Read the pins
+        shell: bash
+        run: grep -E '^[A-Z_]+=' PIN >> "$GITHUB_ENV"
+
+      - name: Reclaim disk
+        shell: pwsh
+        run: |
+          # Every drive, not just C:. Where the bundle is staged depends on
+          # which one has the room, and "no space" arrives from deep inside
+          # gclient as a write error that names nothing.
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name, Used, Free | Format-Table
+          foreach ($path in @(
+            "$env:ProgramFiles\dotnet\sdk",
+            "${env:ProgramFiles(x86)}\Android",
+            "$env:AGENT_TOOLSDIRECTORY\Ruby",
+            "$env:AGENT_TOOLSDIRECTORY\go",
+            "$env:AGENT_TOOLSDIRECTORY\CodeQL",
+            "$env:AGENT_TOOLSDIRECTORY\PyPy",
+            "C:\Modules",
+            "$env:ProgramFiles\MongoDB",
+            "$env:ProgramFiles\PostgreSQL",
+            "${env:ProgramFiles(x86)}\Microsoft SQL Server",
+            "$env:ProgramFiles\Microsoft SQL Server",
+            "C:\SeleniumWebDrivers"
+          )) {
+            if (Test-Path $path) { Remove-Item -Recurse -Force $path -ErrorAction SilentlyContinue }
+          }
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name, Used, Free | Format-Table
+
+      # PINNED, for the reason the linux job gives — and the pin is exactly why
+      # this step has to run the bootstrap by hand.
+      #
+      # depot_tools on Windows does not call `git`. It calls `git.bat`
+      # (git_cache.py: `git_exe = "git.bat" if sys.platform.startswith("win")`),
+      # a stub that is NOT in the repository — .gitignore lists it — because
+      # bootstrap/bootstrap.py generates it, pointed at whatever Git the machine
+      # has. CreateProcess resolves a name that already carries an extension by
+      # exact match along PATH, so Git for Windows' git.exe cannot stand in for
+      # it, and GetCachePath catches CalledProcessError, not FileNotFoundError.
+      #
+      # Normally `fetch` triggers that generation: fetch.bat calls
+      # update_depot_tools.bat, which ends in bootstrap\win_tools.bat. But
+      # update_depot_tools.bat returns at `IF "%DEPOT_TOOLS_UPDATE%" == "0"`,
+      # several lines BEFORE that call — and this job sets DEPOT_TOOLS_UPDATE=0,
+      # because the lines after it are `git fetch origin` and `git checkout
+      # origin/main` and the pin would be gone. Pinning depot_tools therefore
+      # switches its Windows bootstrap off. Run 31680937721 is what that looks
+      # like: FileNotFoundError [WinError 2] out of gclient sync, six minutes in.
+      # xVeil's webrtc-windows.yml built this same target fine on 2026-07-31 for
+      # the one reason that it had not pinned depot_tools yet.
+      - name: depot_tools
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git clone --filter=blob:none https://chromium.googlesource.com/chromium/tools/depot_tools.git C:\depot_tools
+          if ($LASTEXITCODE -ne 0) { throw 'depot_tools clone failed' }
+          git -C C:\depot_tools checkout --detach $env:DEPOT_TOOLS_PIN
+          if ($LASTEXITCODE -ne 0) { throw "depot_tools has no commit $env:DEPOT_TOOLS_PIN" }
+
+          # The state that killed run 31680937721, recorded rather than assumed.
+          Write-Host "system git.exe:           $((Get-Command git.exe -ErrorAction SilentlyContinue).Source)"
+          Write-Host "git.bat before bootstrap: $(Test-Path C:\depot_tools\git.bat)"
+
+          # bootstrap.py applies these itself, but only after being told it may
+          # touch the global config. autocrlf is not cosmetic on a Chromium
+          # checkout: Git for Windows defaults it on, and a checkout rewritten
+          # to CRLF fails later in places that do not mention line endings.
+          git config --global depot-tools.allowGlobalGitConfig true
+          git config --global core.autocrlf false
+          git config --global core.longpaths true
+
+          & C:\depot_tools\bootstrap\win_tools.bat
+          if ($LASTEXITCODE -ne 0) { throw "depot_tools bootstrap failed ($LASTEXITCODE)" }
+
+          # The artifact, not the exit code. This is the file whose absence was
+          # the whole failure, so its presence is what gets asserted.
+          if (-not (Test-Path C:\depot_tools\git.bat)) {
+            throw 'bootstrap reported success and produced no C:\depot_tools\git.bat'
+          }
+          & C:\depot_tools\git.bat --version
+          if ($LASTEXITCODE -ne 0) { throw 'the generated git.bat does not run' }
+
+          "DEPOT_TOOLS_UPDATE=0" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "C:\depot_tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: WebRTC at the pinned commit
+        shell: cmd
+        run: |
+          rem Resolve the exact name depot_tools will spawn, before paying 25
+          rem minutes to be told the same thing by a traceback. `where` searches
+          rem PATH the way CreateProcess does and exits 1 when it finds nothing.
+          where git.bat || exit /b 1
+          mkdir %WEBRTC_ROOT%
+          cd /d %WEBRTC_ROOT%
+          call fetch --nohooks webrtc || exit /b 1
+          cd src
+          call git checkout %WEBRTC_PIN% || exit /b 1
+          for /L %%a in (1,1,6) do (
+            echo sync attempt %%a
+            call gclient sync --with_branch_heads --reset --jobs 4 && goto :synced
+            timeout /t 30 /nobreak > nul
+          )
+          echo ::error::gclient sync failed after 6 attempts
+          exit /b 1
+          :synced
+          echo sync complete
+
+      # Split from the ninja below on purpose. gn takes a minute and ninja takes
+      # the best part of an hour, and everything the bundle has to reproduce is
+      # decided by gn — so the command call.cc is compiled with gets read out
+      # here, where it is readable whether or not the build that follows works.
+      #
+      # Still cmd, and the args string is still spelled with backslash-escaped
+      # quotes: this exact line is what built win-arm64 in xVeil's run
+      # 30665287484, and re-quoting it for a nicer shell is a way to lose an
+      # hour to gn parsing `target_os=win` as a bare identifier.
+      - name: Configure
+        shell: cmd
+        run: |
+          cd /d %WEBRTC_ROOT%\src
+          call gn gen out/win-arm64 --export-compile-commands --args="target_os=\"win\" target_cpu=\"arm64\" is_debug=false is_component_build=false symbol_level=0 rtc_include_tests=false rtc_build_examples=false rtc_build_tools=false rtc_enable_protobuf=false rtc_use_h264=false enable_libaom=false rtc_include_opus=true treat_warnings_as_errors=false" || exit /b 1
+          if not exist out\win-arm64\compile_commands.json (
+            echo ::error::gn produced no compile_commands.json - the bundle is built out of it
+            exit /b 1
+          )
+
+      # What the bundle has to be able to reproduce, printed once. Windows is
+      # the one target whose compile command has never been read: it decides
+      # whether the sysroot is inside the checkout, whether the source path in
+      # the command is the same string as the entry's "file" field, and which
+      # CRT the wrapper has to link — none of which is guessable from the other
+      # four targets.
+      - name: Record the command the bundle has to reproduce
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # python, not ConvertFrom-Json: compile_commands.json is ~100 MB here
+          # and PowerShell's JSON parser turns that into minutes and gigabytes.
+          $py = @(
+            'import json, sys',
+            'cc = json.load(open(sys.argv[1]))',
+            'e = next(x for x in cc if x.get("file", "").replace("\\", "/").endswith("call/call.cc"))',
+            'print("entries:  ", len(cc))',
+            'print("directory:", e["directory"])',
+            'print("file:     ", e["file"])',
+            'print("command:  ", e.get("command") or " ".join(e["arguments"]))'
+          ) -join "`n"
+          Set-Content -Path "$env:RUNNER_TEMP\show_cc.py" -Value $py -Encoding ascii
+          & C:\depot_tools\python3.bat "$env:RUNNER_TEMP\show_cc.py" `
+            "$env:WEBRTC_ROOT\src\out\win-arm64\compile_commands.json"
+          if ($LASTEXITCODE -ne 0) { throw 'call/call.cc is not in compile_commands.json' }
+
+      - name: Build webrtc.lib
+        shell: cmd
+        run: |
+          cd /d %WEBRTC_ROOT%\src
+          call ninja -C out/win-arm64 webrtc || exit /b 1
+          dir out\win-arm64\obj\webrtc.lib
+
+      - name: Package the SDK bundle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # depot_tools' own cpython, which the step above proved is installed.
+          # `python3` is not a name that resolves on a Windows runner's PATH,
+          # and `python` is whatever the image happens to preinstall.
+          & C:\depot_tools\python3.bat scripts\pack_sdk.py `
+            --src "$env:WEBRTC_ROOT\src" `
+            --out "out/win-arm64" `
+            --target win-arm64 `
+            --dest "$env:SDK_STAGE\veil-webrtc-sdk-win-arm64" `
+            --webrtc-pin "$env:WEBRTC_PIN" `
+            --depot-tools-pin "$env:DEPOT_TOOLS_PIN" `
+            --schema "$env:SDK_SCHEMA" `
+            --built-by "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+          if ($LASTEXITCODE -ne 0) { throw 'pack_sdk.py failed' }
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name, Used, Free | Format-Table
+
+      # Zip rather than tar.xz on this one target: PowerShell's Expand-Archive
+      # reads it with no question, and whether the bundled tar.exe was built
+      # with liblzma is not something to discover on a consumer's machine.
+      #
+      # Compressed with 7-Zip when the image has it, because Compress-Archive
+      # walks a multi-gigabyte tree one entry at a time and this bundle carries
+      # a clang toolchain. Compress-Archive stays as the fallback so the step
+      # does not depend on an image detail.
+      - name: Compress
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path $env:SDK_ASSETS | Out-Null
+          $bundle = "$env:SDK_STAGE\veil-webrtc-sdk-win-arm64"
+          $zip = "$env:SDK_ASSETS\veil-webrtc-sdk-win-arm64.zip"
+          $sevenZip = @("$env:ProgramFiles\7-Zip\7z.exe", "${env:ProgramFiles(x86)}\7-Zip\7z.exe") |
+            Where-Object { Test-Path $_ } | Select-Object -First 1
+          if ($sevenZip) {
+            Write-Host "==> compressing with $sevenZip"
+            & $sevenZip a -tzip -mx=6 -mmt=on -bso0 -bsp0 $zip $bundle
+            if ($LASTEXITCODE -ne 0) { throw "7z exited $LASTEXITCODE" }
+          } else {
+            Write-Host '==> compressing with Compress-Archive'
+            Compress-Archive -Path $bundle -DestinationPath $zip
+          }
+          if (-not (Test-Path $zip)) { throw "no $zip after compressing" }
+
+          Copy-Item "$bundle\src\out\win-arm64\obj\webrtc.lib" "$env:SDK_ASSETS\webrtc-win-arm64.lib"
+          Copy-Item "$bundle\veil-webrtc-sdk.json" "$env:SDK_ASSETS\veil-webrtc-sdk-win-arm64.json"
+          Get-ChildItem $env:SDK_ASSETS | Select-Object Name, Length | Format-Table
+          # A release asset is capped at 2 GB and this is the only target whose
+          # archive could approach it. Fail here, where it is one line, rather
+          # than in the publish job after another hour.
+          $size = (Get-Item $zip).Length
+          if ($size -ge 2GB) { throw "$zip is $size bytes - over GitHub's 2 GB asset cap" }
+
+      # Uploaded BEFORE the verify below, which is the one departure from the
+      # linux job's order. The verify runs a wrapper build that this repository
+      # does not own; if it fails, the hour of WebRTC that produced these assets
+      # should still be in hand to look at rather than thrown away with the
+      # runner.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          # Forward slashes: this is a glob pattern, not a path, and a
+          # backslash in one is an escape character.
+          name: sdk-win-arm64
+          path: C:/sdk-assets/*
+          if-no-files-found: error
+
+      # The claim being tested is "this bundle alone builds the wrapper", so the
+      # checkout it was cut from is renamed away first — see verify-sdk.ps1 and
+      # the identical note on the linux job.
+      - name: The bundle alone builds the wrapper
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git clone --depth 1 https://github.com/veilnetwork/veil.git "$env:RUNNER_TEMP\veil"
+          if ($LASTEXITCODE -ne 0) { throw 'could not clone veil' }
+          Write-Host "veil at $(git -C "$env:RUNNER_TEMP\veil" rev-parse HEAD)"
+          & .\scripts\verify-sdk.ps1 `
+            -Bundle "$env:SDK_STAGE\veil-webrtc-sdk-win-arm64" `
+            -Target win-arm64 `
+            -Veil "$env:RUNNER_TEMP\veil" `
+            -Hide "$env:WEBRTC_ROOT" `
+            -Dest "$env:RUNNER_TEMP\engine-out"
+
+  # -------------------------------------------------------------- publish ---
+  # The only job that can write. It compiles nothing and downloads nothing from
+  # the network beyond the run's own artifacts, so the token with write access
+  # is never in the same job as a build that executes third-party code.
   publish:
     name: publish
-    needs: [linux, windows]
-    if: ${{ !cancelled() && inputs.publish && (needs.linux.result == 'success' || needs.windows.result == 'success') }}
+    # windows-arm64 joins the wait. `always()` below already lets publish run
+    # when a target was not requested — a job skipped by its `if` is not a
+    # failure — so adding it here does not tie an x64-only run to an arm64
+    # build that never started.
+    needs: [linux, windows, windows-arm64]
+    if: ${{ !cancelled() && inputs.publish
+        && (needs.linux.result == 'success' || needs.windows.result == 'success'
+            || needs['windows-arm64'].result == 'success') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
