@@ -174,8 +174,24 @@ jobs:
           gn gen "out/${{ matrix.target }}" --export-compile-commands --args='${{ matrix.gn_args }}'
           test -f "out/${{ matrix.target }}/compile_commands.json" \
             || { echo "::error::gn produced no compile_commands.json — the bundle is built out of it"; exit 1; }
-          ninja -C "out/${{ matrix.target }}" webrtc
+          # The libc++ targets are asked for BY NAME. `webrtc` is a static
+          # library and does not link a C++ runtime, so nothing in its graph
+          # pulls Chromium's libc++ in — it just happens to be built as a side
+          # effect on x64. On arm64 it was not, and the bundle went out with
+          # `obj/buildtools/third_party/libc++: 0 files`; the wrapper links
+          # against those objects (the __Cr inline namespace), so the failure
+          # landed in the self-check with a `find` that matched nothing.
+          ninja -C "out/${{ matrix.target }}" webrtc \
+            buildtools/third_party/libc++ buildtools/third_party/libc++abi
           ls -la "out/${{ matrix.target }}/obj/libwebrtc.a"
+          # Assert rather than trust: an empty objects directory is exactly what
+          # shipped last time, and it is invisible until the wrapper link.
+          for comp in libc++ libc++abi; do
+            n=$(find "out/${{ matrix.target }}/obj/buildtools/third_party/$comp" \
+                  -name '*.o' 2>/dev/null | wc -l)
+            [ "$n" -gt 0 ] || { echo "::error::no $comp objects — the wrapper cannot link"; exit 1; }
+            echo "  $comp: $n objects"
+          done
 
       - name: Package the SDK bundle
         if: steps.want.outputs.run == 'yes'
