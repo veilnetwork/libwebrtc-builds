@@ -435,8 +435,22 @@ jobs:
         shell: cmd
         run: |
           cd /d %WEBRTC_ROOT%\src
-          call ninja -C out/win-x64 webrtc || exit /b 1
+          rem Named for the same reason as in win-arm64 below: nothing in the
+          rem `webrtc` graph requires libc++, so its presence here is a side
+          rem effect this build should not depend on. Already built on x64, so
+          rem naming it costs nothing and turns a silent gap into a hard stop.
+          call ninja -C out/win-x64 webrtc buildtools/third_party/libc++ || exit /b 1
           dir out\win-x64\obj\webrtc.lib
+
+      - name: Assert the C++ runtime objects exist
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = "$env:WEBRTC_ROOT\src\out\win-x64\obj\buildtools\third_party\libc++"
+          $n = (Get-ChildItem -Path $dir -Filter *.obj -Recurse -ErrorAction SilentlyContinue |
+                Measure-Object).Count
+          if ($n -eq 0) { throw "no libc++ objects under $dir - the wrapper cannot link" }
+          Write-Host "  libc++: $n objects"
 
       - name: Package the SDK bundle
         shell: pwsh
@@ -734,8 +748,31 @@ jobs:
         shell: cmd
         run: |
           cd /d %WEBRTC_ROOT%\src
-          call ninja -C out/win-arm64 webrtc || exit /b 1
+          rem libc++ is asked for BY NAME. `webrtc` is a static library and links
+          rem no C++ runtime, so nothing in its graph pulls Chromium's libc++ in
+          rem — on x64 it lands there anyway, on arm64 it did not. gn had made
+          rem the target (its objects directory exists) and ninja simply never
+          rem built it, so the bundle shipped `libc++: 0 files` and the failure
+          rem surfaced two steps later, in the wrapper link against the __Cr
+          rem inline namespace.
+          rem
+          rem Only libc++: Windows takes its ABI and unwinder from MSVC, so
+          rem libc++abi and libunwind have no target here and never did — the
+          rem packer reports them absent on green x64 builds too.
+          call ninja -C out/win-arm64 webrtc buildtools/third_party/libc++ || exit /b 1
           dir out\win-arm64\obj\webrtc.lib
+
+      # Assert rather than trust: an empty objects directory is exactly what
+      # shipped last time, and it stays invisible until the wrapper link.
+      - name: Assert the C++ runtime objects exist
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = "$env:WEBRTC_ROOT\src\out\win-arm64\obj\buildtools\third_party\libc++"
+          $n = (Get-ChildItem -Path $dir -Filter *.obj -Recurse -ErrorAction SilentlyContinue |
+                Measure-Object).Count
+          if ($n -eq 0) { throw "no libc++ objects under $dir - the wrapper cannot link" }
+          Write-Host "  libc++: $n objects"
 
       - name: Package the SDK bundle
         shell: pwsh
