@@ -80,13 +80,19 @@ try {
           Sort-Object Name -Descending | Select-Object -First 1
       }
       $kits = (Get-ItemProperty 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows Kits\Installed Roots' -ErrorAction SilentlyContinue).KitsRoot10
+      # The ARCHITECTURE OF THE BUNDLE, not of whatever built this script last.
+      # These paths were a hardcoded x64, so verifying an arm64 bundle pointed
+      # the linker at x64 import libraries and every single libc++ object came
+      # back "machine type arm64 conflicts with x64" -- a wall of errors that
+      # reads like a broken bundle and is really a wrong -Target lookup.
+      $arch = if ($Target -like '*-arm64') { 'arm64' } else { 'x64' }
       $libs = @()
-      if ($tools) { $libs += (Join-Path $tools.FullName 'lib\x64') }
+      if ($tools) { $libs += (Join-Path $tools.FullName "lib\$arch") }
       if ($kits) {
         $sdk = Get-ChildItem (Join-Path $kits 'Lib') -Directory -ErrorAction SilentlyContinue |
           Where-Object { $_.Name -like '10.*' } | Sort-Object Name -Descending | Select-Object -First 1
         if ($sdk) {
-          foreach ($part in @('um\x64', 'ucrt\x64')) {
+          foreach ($part in @("um\$arch", "ucrt\$arch")) {
             $p = Join-Path $sdk.FullName $part
             if (Test-Path $p) { $libs += $p }
           }
