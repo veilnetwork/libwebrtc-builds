@@ -24,7 +24,7 @@ on:
   workflow_dispatch:
     inputs:
       targets:
-        description: 'Space-separated: linux-x64 linux-arm64 android-arm64 win-x64 win-arm64'
+        description: 'Space-separated. linux-x64 linux-arm64 | android-arm64 android-arm android-x64 | win-x64 win-arm64 | mac-arm64 mac-x64 | ios-arm64 ios-sim-arm64 ios-sim-x64'
         required: false
         type: string
         default: 'linux-x64 android-arm64'
@@ -47,8 +47,7 @@ jobs:
   linux:
     name: ${{ matrix.target }}
     runs-on: ubuntu-latest
-    if: ${{ contains(inputs.targets, 'linux-x64') || contains(inputs.targets, 'linux-arm64')
-        || contains(inputs.targets, 'android-arm64') }}
+    if: ${{ contains(inputs.targets, 'linux-') || contains(inputs.targets, 'android-') }}
     timeout-minutes: 350
     strategy:
       fail-fast: false
@@ -78,6 +77,19 @@ jobs:
             # compiling. Those targets analyse WebRTC's Java SDK; this build
             # wants libwebrtc.a and neither compiles nor ships that Java.
             gn_args: 'target_os="android" target_cpu="arm64" is_debug=false is_component_build=false symbol_level=0 rtc_include_tests=false rtc_build_examples=false rtc_build_tools=false rtc_enable_protobuf=false rtc_use_h264=false enable_libaom=false rtc_include_opus=true treat_warnings_as_errors=false android_static_analysis="off"'
+            gclient_os: 'android'
+            gclient_cpu: ''
+          # The other two ABIs an APK ships. `armeabi-v7a` is still the only
+          # thing that runs on the cheap phones this project is for, and
+          # `x86_64` is what every emulator is — a developer without it cannot
+          # run the app at all on a desktop. Same host, same recipe as arm64;
+          # only target_cpu differs, and gn's own name for 32-bit ARM is "arm".
+          - target: android-arm
+            gn_args: 'target_os="android" target_cpu="arm" is_debug=false is_component_build=false symbol_level=0 rtc_include_tests=false rtc_build_examples=false rtc_build_tools=false rtc_enable_protobuf=false rtc_use_h264=false enable_libaom=false rtc_include_opus=true treat_warnings_as_errors=false android_static_analysis="off"'
+            gclient_os: 'android'
+            gclient_cpu: ''
+          - target: android-x64
+            gn_args: 'target_os="android" target_cpu="x64" is_debug=false is_component_build=false symbol_level=0 rtc_include_tests=false rtc_build_examples=false rtc_build_tools=false rtc_enable_protobuf=false rtc_use_h264=false enable_libaom=false rtc_include_opus=true treat_warnings_as_errors=false android_static_analysis="off"'
             gclient_os: 'android'
             gclient_cpu: ''
     env:
@@ -246,6 +258,191 @@ jobs:
           # The manifest as its own small asset: a consumer checking that its
           # pin matches the published one should not have to download 150 MB
           # to read one field.
+          cp "veil-webrtc-sdk-${{ matrix.target }}/veil-webrtc-sdk.json" \
+             "assets/veil-webrtc-sdk-${{ matrix.target }}.json"
+          ls -la assets/
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: steps.want.outputs.run == 'yes'
+        with:
+          name: sdk-${{ matrix.target }}
+          path: ${{ runner.temp }}/assets/*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------- apple ---
+  # macOS and iOS need a macOS HOST: the toolchain is Xcode's, the frameworks
+  # (AVFoundation, VideoToolbox, CoreMedia) come from Apple's SDK, and neither
+  # is fetched by depot_tools the way the Android NDK is.
+  #
+  # The packaging already knew about these targets before this job existed:
+  # pack_sdk.py rewrites `-isysroot` to whatever Xcode the CONSUMER has, because
+  # Apple's SDK is not ours to redistribute and the consumer's version differs,
+  # and it recreates the `sdk/xcode_links` symlink the link step reads instead of
+  # compile_commands.json. verify-sdk.sh has had a recipe for `mac-*` and
+  # `ios-*` for as long. So this job is the missing half, not a new mechanism.
+  apple:
+    name: ${{ matrix.target }}
+    # arm64 runner. A mac-x64 bundle is CROSS-compiled here, exactly as
+    # linux-arm64 is cross-compiled on an x64 host — the toolchain is universal
+    # and only target_cpu differs.
+    runs-on: macos-14
+    if: ${{ contains(inputs.targets, 'mac-') || contains(inputs.targets, 'ios-') }}
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: mac-arm64
+            gn_args: 'target_os="mac" target_cpu="arm64" is_debug=false is_component_build=false symbol_level=0 rtc_include_tests=false rtc_build_examples=false rtc_build_tools=false rtc_enable_protobuf=false rtc_use_h264=false enable_libaom=false rtc_include_opus=true treat_warnings_as_errors=false'
+          - target: mac-x64
+            gn_args: 'target_os="mac" target_cpu="x64" is_debug=false is_component_build=false symbol_level=0 rtc_include_tests=false rtc_build_examples=false rtc_build_tools=false rtc_enable_protobuf=false rtc_use_h264=false enable_libaom=false rtc_include_opus=true treat_warnings_as_errors=false'
+          # A device build is signed by whoever ships the app, never here — this
+          # produces a static library, and a signing identity in a build
+          # repository would be both useless and a liability.
+          - target: ios-arm64
+            gn_args: 'target_os="ios" target_cpu="arm64" ios_enable_code_signing=false is_debug=false is_component_build=false symbol_level=0 rtc_include_tests=false rtc_build_examples=false rtc_build_tools=false rtc_enable_protobuf=false rtc_use_h264=false enable_libaom=false rtc_include_opus=true treat_warnings_as_errors=false'
+          # The simulator is a DIFFERENT target, not a debug flavour of the
+          # device one: same CPU, different SDK and a different `-isysroot`, so a
+          # device bundle will not link a simulator app. Both are published
+          # because a developer needs the simulator and a user needs the device.
+          - target: ios-sim-arm64
+            gn_args: 'target_os="ios" target_cpu="arm64" target_environment="simulator" ios_enable_code_signing=false is_debug=false is_component_build=false symbol_level=0 rtc_include_tests=false rtc_build_examples=false rtc_build_tools=false rtc_enable_protobuf=false rtc_use_h264=false enable_libaom=false rtc_include_opus=true treat_warnings_as_errors=false'
+          # For an Intel Mac running the simulator. Cheap to add beside the
+          # others; dropped from the default target list, not from the matrix.
+          - target: ios-sim-x64
+            gn_args: 'target_os="ios" target_cpu="x64" target_environment="simulator" ios_enable_code_signing=false is_debug=false is_component_build=false symbol_level=0 rtc_include_tests=false rtc_build_examples=false rtc_build_tools=false rtc_enable_protobuf=false rtc_use_h264=false enable_libaom=false rtc_include_opus=true treat_warnings_as_errors=false'
+    env:
+      WEBRTC_ROOT: ${{ github.workspace }}/../webrtc
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Read the pins
+        run: grep -E '^[A-Z_]+=' PIN >> "$GITHUB_ENV"
+
+      - name: Skip targets not asked for
+        id: want
+        run: |
+          if echo "${{ inputs.targets }}" | grep -qw "${{ matrix.target }}"; then
+            echo "run=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=no" >> "$GITHUB_OUTPUT"
+            echo "${{ matrix.target }} was not requested"
+          fi
+
+      # Say which Xcode built this. The bundle rewrites -isysroot on the
+      # consumer's machine, so the two versions need not match — but when a
+      # header does go missing, the first question is which SDK it was compiled
+      # against, and a log that cannot answer costs a rebuild.
+      - name: Xcode
+        if: steps.want.outputs.run == 'yes'
+        run: |
+          xcode-select -p
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
+
+      - name: Reclaim disk
+        if: steps.want.outputs.run == 'yes'
+        run: |
+          echo "before:"; df -h / | tail -1
+          sudo rm -rf /Applications/Xcode_14*.app /Applications/Xcode_15.0*.app \
+                      ~/Library/Developer/CoreSimulator/Caches || true
+          echo "after:"; df -h / | tail -1
+
+      - name: depot_tools
+        if: steps.want.outputs.run == 'yes'
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none \
+            https://chromium.googlesource.com/chromium/tools/depot_tools.git \
+            "$HOME/depot_tools"
+          git -C "$HOME/depot_tools" checkout --detach "$DEPOT_TOOLS_PIN"
+          "$HOME/depot_tools/ensure_bootstrap"
+          echo "DEPOT_TOOLS_UPDATE=0" >> "$GITHUB_ENV"
+          echo "$HOME/depot_tools" >> "$GITHUB_PATH"
+
+      # target_os = ['ios'] before the sync, for the same reason android needs
+      # it: the iOS-only parts of the dependency tree are not fetched otherwise
+      # and gn fails later on a missing toolchain rather than on the real cause.
+      - name: WebRTC at the pinned commit
+        if: steps.want.outputs.run == 'yes'
+        run: |
+          set -euo pipefail
+          mkdir -p "$WEBRTC_ROOT"
+          cd "$WEBRTC_ROOT"
+          fetch --nohooks webrtc
+          case "${{ matrix.target }}" in
+            ios-*) grep -q "target_os" .gclient || echo "target_os = ['ios']" >> .gclient ;;
+          esac
+          cat .gclient
+          cd src
+          git checkout "$WEBRTC_PIN"
+          ok=0
+          for attempt in 1 2 3 4 5 6; do
+            echo "sync attempt $attempt"
+            if gclient sync --with_branch_heads --reset --jobs 4; then ok=1; break; fi
+            sleep $((attempt * 20))
+          done
+          [ "$ok" = 1 ] || { echo "::error::gclient sync failed after 6 attempts"; exit 1; }
+
+      - name: Build libwebrtc.a
+        if: steps.want.outputs.run == 'yes'
+        run: |
+          set -euo pipefail
+          cd "$WEBRTC_ROOT/src"
+          gn gen "out/${{ matrix.target }}" --export-compile-commands --args='${{ matrix.gn_args }}'
+          test -f "out/${{ matrix.target }}/compile_commands.json" \
+            || { echo "::error::gn produced no compile_commands.json — the bundle is built out of it"; exit 1; }
+          # By name, for the reason the other hosts ask by name: `webrtc` is a
+          # static library and pulls no C++ runtime, so on a host where libc++
+          # is not built as a side effect the bundle ships an empty objects
+          # directory and the failure only lands at the consumer's link.
+          ninja -C "out/${{ matrix.target }}" webrtc \
+            buildtools/third_party/libc++ buildtools/third_party/libc++abi
+          ls -la "out/${{ matrix.target }}/obj/libwebrtc.a"
+          for comp in libc++ libc++abi; do
+            n=$(find "out/${{ matrix.target }}/obj/buildtools/third_party/$comp" \
+                  -name '*.o' 2>/dev/null | wc -l)
+            [ "$n" -gt 0 ] || { echo "::error::no $comp objects — the wrapper cannot link"; exit 1; }
+            echo "  $comp: $n objects"
+          done
+
+      - name: Package the SDK bundle
+        if: steps.want.outputs.run == 'yes'
+        run: |
+          set -euo pipefail
+          python3 scripts/pack_sdk.py \
+            --src "$WEBRTC_ROOT/src" \
+            --out "out/${{ matrix.target }}" \
+            --target "${{ matrix.target }}" \
+            --dest "$RUNNER_TEMP/veil-webrtc-sdk-${{ matrix.target }}" \
+            --webrtc-pin "$WEBRTC_PIN" \
+            --depot-tools-pin "$DEPOT_TOOLS_PIN" \
+            --schema "$SDK_SCHEMA" \
+            --built-by "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+      - name: The bundle alone builds the wrapper
+        if: steps.want.outputs.run == 'yes'
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/veilnetwork/veil.git "$RUNNER_TEMP/veil"
+          echo "veil at $(git -C "$RUNNER_TEMP/veil" rev-parse HEAD)"
+          bash scripts/verify-sdk.sh \
+            --bundle "$RUNNER_TEMP/veil-webrtc-sdk-${{ matrix.target }}" \
+            --target "${{ matrix.target }}" \
+            --veil "$RUNNER_TEMP/veil" \
+            --hide "$WEBRTC_ROOT" \
+            --dest "$RUNNER_TEMP/engine-out"
+
+      - name: Compress
+        if: steps.want.outputs.run == 'yes'
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/assets"
+          cd "$RUNNER_TEMP"
+          tar -C "$RUNNER_TEMP" -cf - "veil-webrtc-sdk-${{ matrix.target }}" \
+            | xz -T0 -6 > "assets/veil-webrtc-sdk-${{ matrix.target }}.tar.xz"
+          cp "veil-webrtc-sdk-${{ matrix.target }}/src/out/${{ matrix.target }}/obj/libwebrtc.a" \
+             "assets/libwebrtc-${{ matrix.target }}.a"
           cp "veil-webrtc-sdk-${{ matrix.target }}/veil-webrtc-sdk.json" \
              "assets/veil-webrtc-sdk-${{ matrix.target }}.json"
           ls -la assets/
@@ -869,9 +1066,10 @@ jobs:
     # when a target was not requested — a job skipped by its `if` is not a
     # failure — so adding it here does not tie an x64-only run to an arm64
     # build that never started.
-    needs: [linux, windows, windows-arm64]
+    needs: [linux, apple, windows, windows-arm64]
     if: ${{ !cancelled() && inputs.publish
-        && (needs.linux.result == 'success' || needs.windows.result == 'success'
+        && (needs.linux.result == 'success' || needs.apple.result == 'success'
+            || needs.windows.result == 'success'
             || needs['windows-arm64'].result == 'success') }}
     runs-on: ubuntu-latest
     permissions:
