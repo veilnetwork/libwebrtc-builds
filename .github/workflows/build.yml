@@ -299,8 +299,14 @@ jobs:
           # A device build is signed by whoever ships the app, never here — this
           # produces a static library, and a signing identity in a build
           # repository would be both useless and a liability.
+          # target_environment="device" is REQUIRED, not a default. gn asserts
+          # it is one of simulator/device/catalyst, and an unset value fails the
+          # assertion with an empty string in the message — which reads like a
+          # missing SDK rather than a missing argument. Only the simulator line
+          # carried it, so the device build died at gn gen after a 20-minute
+          # sync.
           - target: ios-arm64
-            gn_args: 'target_os="ios" target_cpu="arm64" ios_enable_code_signing=false is_debug=false is_component_build=false symbol_level=0 rtc_include_tests=false rtc_build_examples=false rtc_build_tools=false rtc_enable_protobuf=false rtc_use_h264=false enable_libaom=false rtc_include_opus=true treat_warnings_as_errors=false'
+            gn_args: 'target_os="ios" target_cpu="arm64" target_environment="device" ios_enable_code_signing=false is_debug=false is_component_build=false symbol_level=0 rtc_include_tests=false rtc_build_examples=false rtc_build_tools=false rtc_enable_protobuf=false rtc_use_h264=false enable_libaom=false rtc_include_opus=true treat_warnings_as_errors=false'
           # The simulator is a DIFFERENT target, not a debug flavour of the
           # device one: same CPU, different SDK and a different `-isysroot`, so a
           # device bundle will not link a simulator app. Both are published
