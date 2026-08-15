@@ -61,8 +61,10 @@ case "$TARGET" in
     bash "$MEDIA/linux/build_veil_media_so_linux.sh" "$DEST"
     artifact="$DEST/libveil_media.so" ;;
   android-*)
-    # This one takes the checkout root rather than src/, and finds out/ itself.
-    WEBRTC_BUILD="$(dirname "$BUNDLE/src")" \
+    # This one takes the checkout root rather than src/, and finds out/ itself —
+    # so it has to be TOLD which ABI, or it looks for android-arm64 whatever the
+    # bundle actually is and reports a missing build instead of a wrong guess.
+    WEBRTC_BUILD="$(dirname "$BUNDLE/src")" ANDROID_TARGET="$TARGET" \
       bash "$MEDIA/android/build_veil_media_so.sh" "$DEST"
     artifact="$DEST/libveil_media.so" ;;
   mac-*)
