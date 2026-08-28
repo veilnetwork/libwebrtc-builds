@@ -111,6 +111,42 @@ jobs:
             echo "${{ matrix.target }} was not requested"
           fi
 
+      # Chromium's bundled android_toolchain is pruned to the ABIs Chromium
+      # itself LINKS. Measured 2026-08-28: its sysroot carries
+      # aarch64-linux-android and nothing else, so armeabi-v7a and x86_64
+      # compile fine (WebRTC only archives them) and then die in the wrapper's
+      # link with `cannot open crtbegin_so.o`. A real NDK has the runtime for
+      # all three — and the reclaim below is what throws the runner's away.
+      #
+      # So salvage it FIRST, and only the part that is needed: one ABI's
+      # library directory, not the six-gigabyte toolchain. Headers are not
+      # involved; compilation keeps Chromium's clang, flags and sysroot, which
+      # is what keeps the objects compatible with libwebrtc.a. Only the
+      # link-time sysroot moves.
+      - name: Keep an NDK sysroot for the ABI Chromium cannot link
+        if: >-
+          steps.want.outputs.run == 'yes' &&
+          startsWith(matrix.target, 'android-')
+        run: |
+          set -euo pipefail
+          case "${{ matrix.target }}" in
+            android-arm64) triple=aarch64-linux-android ;;
+            android-arm)   triple=arm-linux-androideabi ;;
+            android-x64)   triple=x86_64-linux-android ;;
+            *) echo "::error::no triple for ${{ matrix.target }}"; exit 1 ;;
+          esac
+          ndk="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+          src="$ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+          if ! ls "$src/usr/lib/$triple"/*/crtbegin_so.o >/dev/null 2>&1; then
+            echo "::error::the runner's NDK ($ndk) has no C runtime for $triple"
+            exit 1
+          fi
+          dst="$RUNNER_TEMP/ndk-sysroot"
+          mkdir -p "$dst/usr/lib"
+          cp -a "$src/usr/lib/$triple" "$dst/usr/lib/$triple"
+          echo "kept $(du -sh "$dst" | cut -f1) of NDK sysroot for $triple"
+          echo "VEIL_ANDROID_LINK_SYSROOT=$dst" >> "$GITHUB_ENV"
+
       # The WebRTC checkout plus its build tree does not fit beside the runner's
       # preinstalled toolchains, and the failure arrives as a confusing write
       # error deep inside gclient rather than as "no space".
