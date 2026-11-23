@@ -1,0 +1,194 @@
+diff --git a/modules/audio_device/BUILD.gn b/modules/audio_device/BUILD.gn
+index e62ce13..2a08d65 100644
+--- a/modules/audio_device/BUILD.gn
++++ b/modules/audio_device/BUILD.gn
+@@ -372,6 +372,7 @@ rtc_library("audio_device_impl") {
+         sources += [
+           "win/audio_device_core_win.cc",
+           "win/audio_device_core_win.h",
++          "win/wasapi_capture_timeline.h",
+         ]
+         libs = [
+           # Required for the built-in WASAPI AEC.
+diff --git a/modules/audio_device/audio_device_buffer.cc b/modules/audio_device/audio_device_buffer.cc
+index c27ba37..c474490 100644
+--- a/modules/audio_device/audio_device_buffer.cc
++++ b/modules/audio_device/audio_device_buffer.cc
+@@ -294,6 +294,8 @@ int32_t AudioDeviceBuffer::SetRecordedBuffer(
+           timestamp_aligner_.TranslateTimestamp(*capture_timestamp_ns /
+                                                 kNumNanosecsPerMicrosec);
+     }
++  } else {
++    capture_timestamp_ns_.reset();
+   }
+   // Derive a new level value twice per second and check if it is non-zero.
+   int16_t max_abs = 0;
+diff --git a/modules/audio_device/win/audio_device_core_win.cc b/modules/audio_device/win/audio_device_core_win.cc
+index 9bfddf3..beb1993 100644
+--- a/modules/audio_device/win/audio_device_core_win.cc
++++ b/modules/audio_device/win/audio_device_core_win.cc
+@@ -25,9 +25,11 @@
+ #include <uuids.h>
+ #include <windows.h>
+ 
++#include <algorithm>
+ #include <iomanip>
+ 
+ #include "api/make_ref_counted.h"
++#include "modules/audio_device/win/wasapi_capture_timeline.h"
+ #include "rtc_base/checks.h"
+ #include "rtc_base/logging.h"
+ #include "rtc_base/platform_thread.h"
+@@ -3132,6 +3134,8 @@ DWORD AudioDeviceWindowsCore::DoCaptureThread() {
+   HRESULT hr = S_OK;
+   AudioNotificationWait audio_wait;
+ 
++  WasapiCaptureTimeline capture_timeline(_recBlockSize * 100);
++
+   LARGE_INTEGER t1;
+   UINT32 syncBufferSize = 0;
+   REFERENCE_TIME latency = 0;
+@@ -3304,21 +3308,31 @@ DWORD AudioDeviceWindowsCore::DoCaptureThread() {
+ 
+         _readSamples += framesAvailable;
+         processed_audio = true;
+-        syncBufIndex += framesAvailable;
+-
+         QueryPerformanceCounter(&t1);
++        const UINT64 now_100ns =
++            static_cast<UINT64>(t1.QuadPart * _perfCounterFactor);
++        const bool valid_qpc = !(flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR) &&
++                               recTime > 0 && recTime <= now_100ns;
++        capture_timeline.Append(
++            recPos, framesAvailable, recTime, now_100ns, syncBufIndex,
++            valid_qpc, flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY);
++        syncBufIndex += framesAvailable;
++        uint32_t consumed_frames = 0;
+ 
+         // Get the current recording and playout delay.
+-        uint32_t sndCardRecDelay =
+-            (uint32_t)(((((UINT64)t1.QuadPart * _perfCounterFactor) - recTime) /
+-                        10000) +
+-                       (10 * syncBufIndex) / _recBlockSize - 10);
++        const uint32_t capture_age_ms =
++            valid_qpc ? static_cast<uint32_t>(
++                std::min<UINT64>(500, (now_100ns - recTime) / 10000)) : 0;
++        const uint32_t buffered_ms = (10 * syncBufIndex) / _recBlockSize;
++        uint32_t sndCardRecDelay = capture_age_ms + buffered_ms;
++        sndCardRecDelay = sndCardRecDelay >= 10 ? sndCardRecDelay - 10 : 0;
+         uint32_t sndCardPlayDelay = static_cast<uint32_t>(_sndCardPlayDelay);
+ 
+         while (syncBufIndex >= _recBlockSize) {
+           if (_ptrAudioBuffer) {
+-            _ptrAudioBuffer->SetRecordedBuffer((const int8_t*)syncBuffer,
+-                                               _recBlockSize);
++            _ptrAudioBuffer->SetRecordedBuffer(
++                syncBuffer, _recBlockSize,
++                capture_timeline.CaptureTimeNs(consumed_frames));
+             _ptrAudioBuffer->SetVQEData(sndCardPlayDelay, sndCardRecDelay);
+ 
+             _ptrAudioBuffer->SetTypingStatus(KeyPressed());
+@@ -3342,8 +3356,10 @@ DWORD AudioDeviceWindowsCore::DoCaptureThread() {
+                      &syncBuffer[_recBlockSize * _recAudioFrameSize],
+                      (syncBufIndex - _recBlockSize) * _recAudioFrameSize);
+           syncBufIndex -= _recBlockSize;
+-          sndCardRecDelay -= 10;
++          consumed_frames += _recBlockSize;
++          sndCardRecDelay = sndCardRecDelay >= 10 ? sndCardRecDelay - 10 : 0;
+         }
++        capture_timeline.Retain(consumed_frames, syncBufIndex);
+       } else {
+         // If GetBuffer returns AUDCLNT_E_BUFFER_ERROR, the thread consuming the
+         // audio samples must wait for the next processing pass. The client
+diff --git a/modules/audio_device/win/wasapi_capture_timeline.h b/modules/audio_device/win/wasapi_capture_timeline.h
+new file mode 100644
+index 0000000..c931f59
+--- /dev/null
++++ b/modules/audio_device/win/wasapi_capture_timeline.h
+@@ -0,0 +1,86 @@
++#ifndef MODULES_AUDIO_DEVICE_WIN_WASAPI_CAPTURE_TIMELINE_H_
++#define MODULES_AUDIO_DEVICE_WIN_WASAPI_CAPTURE_TIMELINE_H_
++
++#include <cstdint>
++#include <limits>
++#include <optional>
++
++namespace webrtc {
++
++// Track the first sample while WASAPI packets are gathered into the 10 ms
++// blocks expected by AudioTransport. A block spanning a gap still carries
++// the original PCM, but has no single trustworthy capture timestamp.
++class WasapiCaptureTimeline {
++ public:
++  explicit WasapiCaptureTimeline(uint32_t sample_rate_hz)
++      : sample_rate_hz_(sample_rate_hz) {}
++
++  void Append(uint64_t position,
++              uint32_t frames,
++              uint64_t qpc_100ns,
++              uint64_t now_100ns,
++              uint32_t buffered_frames,
++              bool timestamps_valid,
++              bool discontinuity) {
++    packet_offset_ = buffered_frames;
++    now_100ns_ = now_100ns;
++    const bool valid =
++        timestamps_valid && qpc_100ns > 0 && qpc_100ns <= now_100ns &&
++        qpc_100ns <= kMaxQpc100ns &&
++        position <= (std::numeric_limits<uint64_t>::max)() - frames &&
++        (!last_qpc_100ns_ || qpc_100ns > *last_qpc_100ns_);
++    if (!valid || discontinuity || expected_position_ != position) {
++      buffered_timestamp_ns_.reset();
++    }
++    if (!valid) {
++      packet_timestamp_ns_.reset();
++      expected_position_.reset();
++      last_qpc_100ns_.reset();
++      return;
++    }
++    packet_timestamp_ns_ = static_cast<int64_t>(qpc_100ns * 100);
++    expected_position_ = position + frames;
++    last_qpc_100ns_ = qpc_100ns;
++  }
++
++  std::optional<int64_t> CaptureTimeNs(uint32_t offset) const {
++    const bool in_packet = offset >= packet_offset_;
++    const auto anchor =
++        in_packet ? packet_timestamp_ns_ : buffered_timestamp_ns_;
++    if (!anchor || sample_rate_hz_ == 0) {
++      return std::nullopt;
++    }
++    const uint32_t sample_offset = in_packet ? offset - packet_offset_ : offset;
++    const int64_t extra_ns = int64_t{sample_offset} * 1'000'000'000 /
++                             sample_rate_hz_;
++    if (*anchor > (std::numeric_limits<int64_t>::max)() - extra_ns) {
++      return std::nullopt;
++    }
++    const int64_t stamp_ns = *anchor + extra_ns;
++    if (static_cast<uint64_t>(stamp_ns / 100) > now_100ns_) {
++      return std::nullopt;
++    }
++    return stamp_ns;
++  }
++
++  void Retain(uint32_t consumed_frames, uint32_t remaining_frames) {
++    buffered_timestamp_ns_ =
++        remaining_frames > 0 ? CaptureTimeNs(consumed_frames) : std::nullopt;
++  }
++
++ private:
++  static constexpr uint64_t kMaxQpc100ns =
++      (std::numeric_limits<int64_t>::max)() / 100;
++
++  const uint32_t sample_rate_hz_;
++  uint32_t packet_offset_ = 0;
++  uint64_t now_100ns_ = 0;
++  std::optional<uint64_t> expected_position_;
++  std::optional<uint64_t> last_qpc_100ns_;
++  std::optional<int64_t> packet_timestamp_ns_;
++  std::optional<int64_t> buffered_timestamp_ns_;
++};
++
++}  // namespace webrtc
++
++#endif  // MODULES_AUDIO_DEVICE_WIN_WASAPI_CAPTURE_TIMELINE_H_
