@@ -1,0 +1,40 @@
+diff --git a/modules/audio_device/win/audio_device_core_win.cc b/modules/audio_device/win/audio_device_core_win.cc
+index 4f04cee..8d2cc5b 100644
+--- a/modules/audio_device/win/audio_device_core_win.cc
++++ b/modules/audio_device/win/audio_device_core_win.cc
+@@ -3389,7 +3389,6 @@ DWORD AudioDeviceWindowsCore::DoCaptureThread() {
+                       syncBuffer, _recBlockSize,
+                       capture_timeline.CaptureTimeNs(consumed_frames));
+                   _ptrAudioBuffer->SetVQEData(play_delay_ms, rec_delay_ms);
+-                  _ptrAudioBuffer->SetTypingStatus(KeyPressed());
+
+                   _UnLock();  // release lock while making the callback
+                   _ptrAudioBuffer->DeliverRecordedData();
+@@ -4290,13 +4289,4 @@ void AudioDeviceWindowsCore::_TraceCOMError(HRESULT hr) const {
+   RTC_LOG(LS_ERROR) << ToUtf8(buf);
+ }
+
+-bool AudioDeviceWindowsCore::KeyPressed() const {
+-  int key_down = 0;
+-  for (int key = VK_SPACE; key < VK_NUMLOCK; key++) {
+-    short res = GetAsyncKeyState(key);
+-    key_down |= res & 0x1;  // Get the LSB
+-  }
+-  return (key_down > 0);
+-}
+-
+ }  // namespace webrtc
+diff --git a/modules/audio_device/win/audio_device_core_win.h b/modules/audio_device/win/audio_device_core_win.h
+index 36999d2..7f6bd0f 100644
+--- a/modules/audio_device/win/audio_device_core_win.h
++++ b/modules/audio_device/win/audio_device_core_win.h
+@@ -153,9 +153,6 @@ class AudioDeviceWindowsCore : public AudioDeviceGeneric {
+  public:
+   virtual void AttachAudioBuffer(AudioDeviceBuffer* audioBuffer);
+
+- private:
+-  bool KeyPressed() const;
+-
+  private:  // avrt function pointers
+   PAvRevertMmThreadCharacteristics _PAvRevertMmThreadCharacteristics;
+   PAvSetMmThreadCharacteristicsA _PAvSetMmThreadCharacteristicsA;
