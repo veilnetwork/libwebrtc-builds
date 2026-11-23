@@ -260,9 +260,9 @@ bash third_party/veil/flutter/veil_media/linux/build_veil_media_so_linux.sh
 `--expect-pin` is required, not optional: see "Detecting a mismatch" below.
 
 The Windows WASAPI fix is packaged under the `-wasapi1` release suffix.
-Windows capture and playout check the audio buffer after a missed readiness
-notification. Progress in the buffer resets the timeout counter. Four
-consecutive timeouts with no audio progress still end the stream.
+After a 500 ms readiness timeout, both capture and playout check the buffer
+at 10 ms intervals until readiness notifications resume. The stream ends
+after two seconds without a notification or audio buffer progress.
 To select the patched Windows bundle, pass
 `--tag webrtc-4ef980bc2c70834276c791e71e7834b8809f24ad-wasapi1`
 and use a separate `--into` directory for this release. The SDK cache

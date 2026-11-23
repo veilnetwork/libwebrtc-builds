@@ -1,14 +1,56 @@
 diff --git a/modules/audio_device/win/audio_device_core_win.cc b/modules/audio_device/win/audio_device_core_win.cc
 --- a/modules/audio_device/win/audio_device_core_win.cc
 +++ b/modules/audio_device/win/audio_device_core_win.cc
-@@ -2749,18 +2749,19 @@
+@@ -76,6 +76,31 @@
+ enum { COM_THREADING_MODEL = COINIT_MULTITHREADED };
+
+ enum { kAecCaptureStreamIndex = 0, kAecRenderStreamIndex = 1 };
++
++
++// Use event-driven audio normally. If a driver misses a readiness event,
++// check the buffer at the 10 ms audio block cadence until events resume.
++// A faster wait must not shorten the original 2 s failure allowance.
++class AudioNotificationWait {
++ public:
++  void Start() { last_activity_ms_ = GetTickCount64(); }
++
++  DWORD timeout_ms() const { return polling_ ? 10 : 500; }
++
++  bool Observe(DWORD wait_result, bool processed_audio) {
++    polling_ = wait_result == WAIT_TIMEOUT;
++    const ULONGLONG now_ms = GetTickCount64();
++    if (!polling_ || processed_audio) {
++      last_activity_ms_ = now_ms;
++      return false;
++    }
++    return now_ms - last_activity_ms_ >= 2000;
++  }
++
++ private:
++  ULONGLONG last_activity_ms_ = 0;
++  bool polling_ = false;
++};
+
+ // An implementation of IMediaBuffer, as required for
+ // IMediaObject::ProcessOutput(). After consuming data provided by
+@@ -2635,6 +2660,7 @@
+   bool keepPlaying = true;
+   HANDLE waitArray[2] = {_hShutdownRenderEvent, _hRenderSamplesReadyEvent};
+   HRESULT hr = S_OK;
++  AudioNotificationWait audio_wait;
+   HANDLE hMmTask = NULL;
+   IAudioClock* clock = NULL;
+   REFERENCE_TIME latency = 0;
+@@ -2749,18 +2775,20 @@
 
    // >> ------------------ THREAD LOOP ------------------
 
-+  int consecutive_empty_timeouts = 0;
++  audio_wait.Start();
    while (keepPlaying) {
      // Wait for a render notification event or a shutdown event
-     DWORD waitResult = WaitForMultipleObjects(2, waitArray, FALSE, 500);
+-    DWORD waitResult = WaitForMultipleObjects(2, waitArray, FALSE, 500);
++    DWORD waitResult =
++        WaitForMultipleObjects(2, waitArray, FALSE, audio_wait.timeout_ms());
 +    bool processed_audio = false;
      switch (waitResult) {
        case WAIT_OBJECT_0 + 0:  // _hShutdownRenderEvent
@@ -24,7 +66,7 @@ diff --git a/modules/audio_device/win/audio_device_core_win.cc b/modules/audio_d
        default:  // unexpected error
          RTC_LOG(LS_WARNING) << "unknown wait termination on render side";
          goto Exit;
-@@ -2842,6 +2843,7 @@
+@@ -2842,6 +2870,7 @@
          EXIT_ON_ERROR(hr);
 
          _writtenSamples += _playBlockSize;
@@ -32,31 +74,36 @@ diff --git a/modules/audio_device/win/audio_device_core_win.cc b/modules/audio_d
        }
 
        // Check the current delay on the playout side.
-@@ -2857,6 +2859,16 @@
+@@ -2857,6 +2886,11 @@
        }
 
        _UnLock();
 +    }
 +
-+    // A missing notification can still leave an accessible audio buffer.
-+    // End only after repeated timeouts without any device progress.
-+    if (waitResult != WAIT_TIMEOUT || processed_audio) {
-+      consecutive_empty_timeouts = 0;
-+    } else if (++consecutive_empty_timeouts == 4) {
-+      RTC_LOG(LS_WARNING)
-+          << "render event timed out four times without audio progress";
++    if (audio_wait.Observe(waitResult, processed_audio)) {
++      RTC_LOG(LS_WARNING) << "render made no audio progress for 2 seconds";
 +      goto Exit;
      }
    }
 
-@@ -3159,18 +3171,19 @@
+@@ -3069,6 +3103,7 @@
+   bool keepRecording = true;
+   HANDLE waitArray[2] = {_hShutdownCaptureEvent, _hCaptureSamplesReadyEvent};
+   HRESULT hr = S_OK;
++  AudioNotificationWait audio_wait;
+
+   LARGE_INTEGER t1;
+   UINT32 syncBufferSize = 0;
+@@ -3159,18 +3194,20 @@
 
    // >> ---------------------------- THREAD LOOP ----------------------------
 
-+  int consecutive_empty_timeouts = 0;
++  audio_wait.Start();
    while (keepRecording) {
      // Wait for a capture notification event or a shutdown event
-     DWORD waitResult = WaitForMultipleObjects(2, waitArray, FALSE, 500);
+-    DWORD waitResult = WaitForMultipleObjects(2, waitArray, FALSE, 500);
++    DWORD waitResult =
++        WaitForMultipleObjects(2, waitArray, FALSE, audio_wait.timeout_ms());
 +    bool processed_audio = false;
      switch (waitResult) {
        case WAIT_OBJECT_0 + 0:  // _hShutdownCaptureEvent
@@ -72,7 +119,7 @@ diff --git a/modules/audio_device/win/audio_device_core_win.cc b/modules/audio_d
        default:  // unexpected error
          RTC_LOG(LS_WARNING) << "unknown wait termination on capture side";
          goto Exit;
-@@ -3237,6 +3250,7 @@
+@@ -3237,6 +3274,7 @@
          EXIT_ON_ERROR(hr);
 
          _readSamples += framesAvailable;
@@ -80,18 +127,13 @@ diff --git a/modules/audio_device/win/audio_device_core_win.cc b/modules/audio_d
          syncBufIndex += framesAvailable;
 
          QueryPerformanceCounter(&t1);
-@@ -3293,6 +3307,16 @@
+@@ -3293,6 +3331,11 @@
 
        _UnLock();
      }
 +
-+    // A missing notification can still leave an accessible audio buffer.
-+    // End only after repeated timeouts without any device progress.
-+    if (waitResult != WAIT_TIMEOUT || processed_audio) {
-+      consecutive_empty_timeouts = 0;
-+    } else if (++consecutive_empty_timeouts == 4) {
-+      RTC_LOG(LS_WARNING)
-+          << "capture event timed out four times without audio progress";
++    if (audio_wait.Observe(waitResult, processed_audio)) {
++      RTC_LOG(LS_WARNING) << "capture made no audio progress for 2 seconds";
 +      goto Exit;
 +    }
    }
