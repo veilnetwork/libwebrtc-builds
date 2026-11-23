@@ -1,0 +1,370 @@
+diff --git a/modules/audio_device/BUILD.gn b/modules/audio_device/BUILD.gn
+index 2a08d65..c75cd4c 100644
+--- a/modules/audio_device/BUILD.gn
++++ b/modules/audio_device/BUILD.gn
+@@ -372,6 +372,7 @@ rtc_library("audio_device_impl") {
+         sources += [
+           "win/audio_device_core_win.cc",
+           "win/audio_device_core_win.h",
++          "win/wasapi_capture_retimer.h",
+           "win/wasapi_capture_timeline.h",
+         ]
+         libs = [
+diff --git a/modules/audio_device/win/audio_device_core_win.cc b/modules/audio_device/win/audio_device_core_win.cc
+index beb1993..8cde6a8 100644
+--- a/modules/audio_device/win/audio_device_core_win.cc
++++ b/modules/audio_device/win/audio_device_core_win.cc
+@@ -27,8 +27,10 @@
+ 
+ #include <algorithm>
+ #include <iomanip>
++#include <vector>
+ 
+ #include "api/make_ref_counted.h"
++#include "modules/audio_device/win/wasapi_capture_retimer.h"
+ #include "modules/audio_device/win/wasapi_capture_timeline.h"
+ #include "rtc_base/checks.h"
+ #include "rtc_base/logging.h"
+@@ -3135,6 +3137,9 @@ DWORD AudioDeviceWindowsCore::DoCaptureThread() {
+   AudioNotificationWait audio_wait;
+ 
+   WasapiCaptureTimeline capture_timeline(_recBlockSize * 100);
++  WasapiCaptureRetimer retimer(_recBlockSize * 100, _recChannels);
++  std::vector<int16_t> packet_samples;
++  uint64_t output_position = 0;
+ 
+   LARGE_INTEGER t1;
+   UINT32 syncBufferSize = 0;
+@@ -3182,7 +3187,12 @@ DWORD AudioDeviceWindowsCore::DoCaptureThread() {
+   // It is used for compensation between native 44.1 and internal 44.0 and
+   // for cases when the capture buffer is larger than 10ms.
+   //
+-  syncBufferSize = 2 * (bufferLength * _recAudioFrameSize);
++  retimer.Prepare(bufferLength);
++  RTC_DCHECK_EQ(_recAudioFrameSize, _recChannels * sizeof(int16_t));
++  packet_samples.resize(static_cast<size_t>(bufferLength) * _recChannels);
++  syncBufferSize = (_recBlockSize +
++                    std::max<UINT32>(bufferLength, retimer.max_output_frames())) *
++                   _recAudioFrameSize;
+   syncBuffer = new BYTE[syncBufferSize];
+   if (syncBuffer == NULL) {
+     return (DWORD)E_POINTER;
+@@ -3291,18 +3301,14 @@ DWORD AudioDeviceWindowsCore::DoCaptureThread() {
+ 
+         RTC_DCHECK_NE(framesAvailable, 0);
+ 
++        const size_t packet_bytes = framesAvailable * _recAudioFrameSize;
++        RTC_CHECK_LE(framesAvailable, bufferLength);
+         if (pData) {
+-          CopyMemory(&syncBuffer[syncBufIndex * _recAudioFrameSize], pData,
+-                     framesAvailable * _recAudioFrameSize);
++          CopyMemory(packet_samples.data(), pData, packet_bytes);
+         } else {
+-          ZeroMemory(&syncBuffer[syncBufIndex * _recAudioFrameSize],
+-                     framesAvailable * _recAudioFrameSize);
++          ZeroMemory(packet_samples.data(), packet_bytes);
+         }
+-        RTC_DCHECK_GE(syncBufferSize, (syncBufIndex * _recAudioFrameSize) +
+-                                          framesAvailable * _recAudioFrameSize);
+ 
+-        // Release the capture buffer
+-        //
+         hr = _ptrCaptureClient->ReleaseBuffer(framesAvailable);
+         EXIT_ON_ERROR(hr);
+ 
+@@ -3313,53 +3319,67 @@ DWORD AudioDeviceWindowsCore::DoCaptureThread() {
+             static_cast<UINT64>(t1.QuadPart * _perfCounterFactor);
+         const bool valid_qpc = !(flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR) &&
+                                recTime > 0 && recTime <= now_100ns;
+-        capture_timeline.Append(
+-            recPos, framesAvailable, recTime, now_100ns, syncBufIndex,
+-            valid_qpc, flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY);
+-        syncBufIndex += framesAvailable;
+-        uint32_t consumed_frames = 0;
+-
+-        // Get the current recording and playout delay.
+-        const uint32_t capture_age_ms =
+-            valid_qpc ? static_cast<uint32_t>(
+-                std::min<UINT64>(500, (now_100ns - recTime) / 10000)) : 0;
+-        const uint32_t buffered_ms = (10 * syncBufIndex) / _recBlockSize;
+-        uint32_t sndCardRecDelay = capture_age_ms + buffered_ms;
+-        sndCardRecDelay = sndCardRecDelay >= 10 ? sndCardRecDelay - 10 : 0;
+-        uint32_t sndCardPlayDelay = static_cast<uint32_t>(_sndCardPlayDelay);
+-
+-        while (syncBufIndex >= _recBlockSize) {
+-          if (_ptrAudioBuffer) {
+-            _ptrAudioBuffer->SetRecordedBuffer(
+-                syncBuffer, _recBlockSize,
+-                capture_timeline.CaptureTimeNs(consumed_frames));
+-            _ptrAudioBuffer->SetVQEData(sndCardPlayDelay, sndCardRecDelay);
+-
+-            _ptrAudioBuffer->SetTypingStatus(KeyPressed());
+-
+-            _UnLock();  // release lock while making the callback
+-            _ptrAudioBuffer->DeliverRecordedData();
+-            _Lock();  // restore the lock
+-
+-            // Sanity check to ensure that essential states are not modified
+-            // during the unlocked period
+-            if (_ptrCaptureClient == NULL || _ptrClientIn == NULL) {
+-              _UnLock();
+-              RTC_LOG(LS_ERROR) << "input state has been modified during"
+-                                   " unlocked period";
+-              goto Exit;
+-            }
+-          }
+-
+-          // store remaining data which was not able to deliver as 10ms segment
+-          MoveMemory(&syncBuffer[0],
+-                     &syncBuffer[_recBlockSize * _recAudioFrameSize],
+-                     (syncBufIndex - _recBlockSize) * _recAudioFrameSize);
+-          syncBufIndex -= _recBlockSize;
+-          consumed_frames += _recBlockSize;
+-          sndCardRecDelay = sndCardRecDelay >= 10 ? sndCardRecDelay - 10 : 0;
++        bool capture_available = true;
++        retimer.Push(
++            packet_samples.data(),
++            {recPos, recTime, framesAvailable, valid_qpc,
++             (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) != 0},
++            [&](const int16_t* samples, WasapiCaptureRetimer::Packet packet) {
++              if (!capture_available) return;
++              const size_t offset_bytes = syncBufIndex * _recAudioFrameSize;
++              const size_t size_bytes = packet.frames * _recAudioFrameSize;
++              RTC_DCHECK_LE(offset_bytes + size_bytes, syncBufferSize);
++              CopyMemory(&syncBuffer[offset_bytes], samples, size_bytes);
++              capture_timeline.Append(
++                  output_position, packet.frames, packet.qpc, now_100ns,
++                  syncBufIndex, packet.valid, packet.discontinuity);
++              output_position += packet.frames;
++              syncBufIndex += packet.frames;
++              uint32_t consumed_frames = 0;
++
++              // Capture age includes the lookahead when the clock is being
++              // corrected. Keep the delay estimate used by echo cancellation.
++              const uint32_t capture_age_ms = packet.valid
++                  ? static_cast<uint32_t>(std::min<UINT64>(
++                        500, (now_100ns - packet.qpc) / 10000))
++                  : 0;
++              const uint32_t buffered_ms = (10 * syncBufIndex) / _recBlockSize;
++              uint32_t rec_delay_ms = capture_age_ms + buffered_ms;
++              rec_delay_ms = rec_delay_ms >= 10 ? rec_delay_ms - 10 : 0;
++              const uint32_t play_delay_ms =
++                  static_cast<uint32_t>(_sndCardPlayDelay);
++              while (syncBufIndex >= _recBlockSize) {
++                if (_ptrAudioBuffer) {
++                  _ptrAudioBuffer->SetRecordedBuffer(
++                      syncBuffer, _recBlockSize,
++                      capture_timeline.CaptureTimeNs(consumed_frames));
++                  _ptrAudioBuffer->SetVQEData(play_delay_ms, rec_delay_ms);
++                  _ptrAudioBuffer->SetTypingStatus(KeyPressed());
++
++                  _UnLock();  // release lock while making the callback
++                  _ptrAudioBuffer->DeliverRecordedData();
++                  _Lock();  // restore the lock
++
++                  if (!_ptrCaptureClient || !_ptrClientIn) {
++                    capture_available = false;
++                    return;
++                  }
++                }
++
++                syncBufIndex -= _recBlockSize;
++                consumed_frames += _recBlockSize;
++                MoveMemory(syncBuffer,
++                           &syncBuffer[_recBlockSize * _recAudioFrameSize],
++                           syncBufIndex * _recAudioFrameSize);
++                rec_delay_ms = rec_delay_ms >= 10 ? rec_delay_ms - 10 : 0;
++              }
++              capture_timeline.Retain(consumed_frames, syncBufIndex);
++            });
++        if (!capture_available) {
++          _UnLock();
++          RTC_LOG(LS_ERROR) << "capture state changed while delivering audio";
++          goto Exit;
+         }
+-        capture_timeline.Retain(consumed_frames, syncBufIndex);
+       } else {
+         // If GetBuffer returns AUDCLNT_E_BUFFER_ERROR, the thread consuming the
+         // audio samples must wait for the next processing pass. The client
+diff --git a/modules/audio_device/win/wasapi_capture_retimer.h b/modules/audio_device/win/wasapi_capture_retimer.h
+new file mode 100644
+index 0000000..de7760a
+--- /dev/null
++++ b/modules/audio_device/win/wasapi_capture_retimer.h
+@@ -0,0 +1,176 @@
++#ifndef MODULES_AUDIO_DEVICE_WIN_WASAPI_CAPTURE_RETIMER_H_
++#define MODULES_AUDIO_DEVICE_WIN_WASAPI_CAPTURE_RETIMER_H_
++
++#include <algorithm>
++#include <cmath>
++#include <cstddef>
++#include <cstdint>
++#include <limits>
++#include <vector>
++
++namespace webrtc {
++
++// WASAPI positions measure captured samples; QPC measures elapsed wall time.
++// Correct sustained disagreement between them before Opus creates RTP time.
++// Normal capture is passed through without waiting for the following packet.
++class WasapiCaptureRetimer {
++ public:
++  struct Packet {
++    uint64_t position = 0;
++    uint64_t qpc = 0;  // WASAPI QPC in 100 ns units.
++    uint32_t frames = 0;
++    bool valid = false;
++    bool discontinuity = false;
++  };
++
++  WasapiCaptureRetimer(uint32_t sample_rate, uint16_t channels)
++      : sample_rate_(sample_rate), channels_(channels) {}
++
++  void Prepare(uint32_t max_input_frames) {
++    pending_samples_.resize(size_t{max_input_frames} * channels_);
++    corrected_samples_.resize(size_t{max_output_frames()} * channels_);
++  }
++
++  uint32_t max_output_frames() const {
++    return (sample_rate_ * 60 + 999) / 1000;
++  }
++
++  template <typename Emit>
++  void Push(const int16_t* samples, Packet packet, Emit&& emit) {
++    const bool contiguous = Contiguous(previous_, packet);
++    if (!contiguous) {
++      if (pending_.frames > 0) {
++        emit(pending_samples_.data(), pending_);
++        pending_ = {};
++      }
++      window_start_ = packet;
++      direction_ = 0;
++      windows_ = 0;
++      packet.discontinuity = true;
++      epoch_qpc_ = 0;
++    } else if (!correcting_) {
++      ObserveRate(packet);
++    }
++    previous_ = packet;
++
++    if (!correcting_ || !packet.valid) {
++      emit(samples, packet);
++      return;
++    }
++
++    if (pending_.frames != 0) {
++      Correct(packet.qpc, emit);
++    } else {
++      // A block straddling the correction boundary has no single capture
++      // timestamp. No samples are discarded at the boundary.
++      packet.discontinuity = true;
++      epoch_qpc_ = packet.qpc;
++    }
++    std::copy_n(samples, size_t{packet.frames} * channels_,
++                pending_samples_.data());
++    pending_ = packet;
++  }
++
++ private:
++  static constexpr uint64_t kQpcPerSecond = 10'000'000;
++  static constexpr uint64_t kMaxInterval = 600'000;  // 60 ms.
++  static constexpr uint64_t kRateWindow = 2'000'000;  // 200 ms.
++  static constexpr int kRequiredWindows = 3;
++  static constexpr int kFilterRadius = 8;
++
++  static bool Contiguous(const Packet& before, const Packet& after) {
++    return before.valid && after.valid && !after.discontinuity &&
++           before.position <=
++               (std::numeric_limits<uint64_t>::max)() - before.frames &&
++           after.position == before.position + before.frames &&
++           after.qpc > before.qpc && after.qpc - before.qpc <= kMaxInterval;
++  }
++
++  void ObserveRate(const Packet& packet) {
++    const uint64_t elapsed = packet.qpc - window_start_.qpc;
++    if (elapsed < kRateWindow) return;
++    const double expected = elapsed * static_cast<double>(sample_rate_) / kQpcPerSecond;
++    const double actual = packet.position - window_start_.position;
++    const int direction = actual > 1.10 * expected ? 1 :
++                          actual < 0.90 * expected ? -1 : 0;
++    windows_ = direction == 0 ? 0 : direction == direction_ ? windows_ + 1 : 1;
++    direction_ = direction;
++    window_start_ = packet;
++    correcting_ = windows_ >= kRequiredWindows;
++  }
++
++  uint64_t SampleIndex(uint64_t qpc) const {
++    const uint64_t elapsed = qpc - epoch_qpc_;
++    return elapsed / kQpcPerSecond * sample_rate_ +
++           (elapsed % kQpcPerSecond * sample_rate_ + kQpcPerSecond - 1) /
++               kQpcPerSecond;
++  }
++
++  static double Sinc(double radians) {
++    return std::abs(radians) < 1e-8 ? 1.0 : std::sin(radians) / radians;
++  }
++
++  template <typename Emit>
++  void Correct(uint64_t end_qpc, Emit& emit) {
++    const uint64_t elapsed = pending_.qpc - epoch_qpc_;
++    const uint64_t phase = elapsed % kQpcPerSecond * sample_rate_ % kQpcPerSecond;
++    const uint64_t to_grid = phase == 0 ? 0 : kQpcPerSecond - phase;
++    const auto output_frames = static_cast<uint32_t>(
++        SampleIndex(end_qpc) - SampleIndex(pending_.qpc));
++    if (output_frames == 0) return;
++    const double nominal_frames =
++        (end_qpc - pending_.qpc) * static_cast<double>(sample_rate_) / kQpcPerSecond;
++    const double stride = pending_.frames / nominal_frames;
++    const double cutoff = (std::min)(1.0, 1.0 / stride);
++    const double first = to_grid / double{kQpcPerSecond};
++    constexpr double kPi = 3.14159265358979323846;
++    for (uint32_t frame = 0; frame < output_frames; ++frame) {
++      const double center = (first + frame) * stride;
++      const int floor = static_cast<int>(center);
++      const int begin = (std::max)(0, floor - kFilterRadius + 1);
++      const int end = (std::min)(static_cast<int>(pending_.frames),
++                                 floor + kFilterRadius + 1);
++      // Clip the filter to this packet. Samples on the far side of a
++      // discontinuity must never take part in reconstruction.
++      double weight_sum = 0;
++      double weights[2 * kFilterRadius];
++      for (int tap = begin; tap < end; ++tap) {
++        const double x = kPi * (tap - center);
++        const double weight = Sinc(cutoff * x) * Sinc(x / kFilterRadius);
++        weights[tap - begin] = weight;
++        weight_sum += weight;
++      }
++      for (uint16_t channel = 0; channel < channels_; ++channel) {
++        double value = 0;
++        for (int tap = begin; tap < end; ++tap) {
++          value += weights[tap - begin] *
++                   pending_samples_[static_cast<size_t>(tap) * channels_ +
++                                    channel];
++        }
++        if (std::abs(weight_sum) > 1e-8) value /= weight_sum;
++        corrected_samples_[size_t{frame} * channels_ + channel] =
++            static_cast<int16_t>(std::round(std::clamp(value, -32768., 32767.)));
++      }
++    }
++    Packet corrected = pending_;
++    corrected.frames = output_frames;
++    corrected.qpc += to_grid / sample_rate_;
++    emit(corrected_samples_.data(), corrected);
++  }
++
++  const uint32_t sample_rate_;
++  const uint16_t channels_;
++  Packet previous_;
++  Packet window_start_;
++  Packet pending_;
++  uint64_t epoch_qpc_ = 0;
++  int direction_ = 0;
++  int windows_ = 0;
++  bool correcting_ = false;
++  std::vector<int16_t> pending_samples_;
++  std::vector<int16_t> corrected_samples_;
++};
++
++}  // namespace webrtc
++
++#endif  // MODULES_AUDIO_DEVICE_WIN_WASAPI_CAPTURE_RETIMER_H_
