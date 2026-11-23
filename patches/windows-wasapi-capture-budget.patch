@@ -1,0 +1,352 @@
+diff --git a/modules/audio_device/BUILD.gn b/modules/audio_device/BUILD.gn
+index 7a4e8c1..6fa5b05 100644
+--- a/modules/audio_device/BUILD.gn
++++ b/modules/audio_device/BUILD.gn
+@@ -372,6 +372,7 @@ rtc_library("audio_device_impl") {
+         sources += [
+           "win/audio_device_core_win.cc",
+           "win/audio_device_core_win.h",
++          "win/wasapi_capture_budget.h",
+           "win/wasapi_capture_retimer.h",
+           "win/wasapi_capture_timeline.h",
+           "win/wasapi_render_retimer.h",
+diff --git a/modules/audio_device/win/audio_device_core_win.cc b/modules/audio_device/win/audio_device_core_win.cc
+index b0580c9..e9be608 100644
+--- a/modules/audio_device/win/audio_device_core_win.cc
++++ b/modules/audio_device/win/audio_device_core_win.cc
+@@ -30,7 +30,7 @@
+ #include <vector>
+ 
+ #include "api/make_ref_counted.h"
+-#include "modules/audio_device/win/wasapi_capture_retimer.h"
++#include "modules/audio_device/win/wasapi_capture_budget.h"
+ #include "modules/audio_device/win/wasapi_capture_timeline.h"
+ #include "modules/audio_device/win/wasapi_render_retimer.h"
+ #include "rtc_base/checks.h"
+@@ -3167,7 +3167,7 @@ DWORD AudioDeviceWindowsCore::DoCaptureThread() {
+   AudioNotificationWait audio_wait;
+ 
+   WasapiCaptureTimeline capture_timeline(_recBlockSize * 100);
+-  WasapiCaptureRetimer retimer(_recBlockSize * 100, _recChannels);
++  WasapiCaptureBudget capture_budget(_recBlockSize * 100, _recChannels);
+   std::vector<int16_t> packet_samples;
+   uint64_t output_position = 0;
+ 
+@@ -3217,11 +3217,11 @@ DWORD AudioDeviceWindowsCore::DoCaptureThread() {
+   // It is used for compensation between native 44.1 and internal 44.0 and
+   // for cases when the capture buffer is larger than 10ms.
+   //
+-  retimer.Prepare(bufferLength);
++  capture_budget.Prepare(bufferLength);
+   RTC_DCHECK_EQ(_recAudioFrameSize, _recChannels * sizeof(int16_t));
+   packet_samples.resize(static_cast<size_t>(bufferLength) * _recChannels);
+   syncBufferSize = (_recBlockSize +
+-                    std::max<UINT32>(bufferLength, retimer.max_output_frames())) *
++                    std::max<UINT32>(bufferLength, capture_budget.max_output_frames())) *
+                    _recAudioFrameSize;
+   syncBuffer = new BYTE[syncBufferSize];
+   if (syncBuffer == NULL) {
+@@ -3350,11 +3350,12 @@ DWORD AudioDeviceWindowsCore::DoCaptureThread() {
+         const bool valid_qpc = !(flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR) &&
+                                recTime > 0 && recTime <= now_100ns;
+         bool capture_available = true;
+-        retimer.Push(
++        capture_budget.Push(
+             packet_samples.data(),
+             {recPos, recTime, framesAvailable, valid_qpc,
+              (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) != 0},
+-            [&](const int16_t* samples, WasapiCaptureRetimer::Packet packet) {
++            now_100ns,
++            [&](const int16_t* samples, WasapiCaptureBudget::Packet packet) {
+               if (!capture_available) return;
+               const size_t offset_bytes = syncBufIndex * _recAudioFrameSize;
+               const size_t size_bytes = packet.frames * _recAudioFrameSize;
+diff --git a/modules/audio_device/win/wasapi_capture_budget.h b/modules/audio_device/win/wasapi_capture_budget.h
+new file mode 100644
+index 0000000..19f8297
+--- /dev/null
++++ b/modules/audio_device/win/wasapi_capture_budget.h
+@@ -0,0 +1,182 @@
++#ifndef MODULES_AUDIO_DEVICE_WIN_WASAPI_CAPTURE_BUDGET_H_
++#define MODULES_AUDIO_DEVICE_WIN_WASAPI_CAPTURE_BUDGET_H_
++
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++#include <limits>
++#include <vector>
++
++#include "modules/audio_device/win/wasapi_capture_retimer.h"
++
++namespace webrtc {
++
++// Account for capture against a single QPC epoch. The hardware rate filter can
++// shorten or lengthen an individual packet, and gaps can remove complete
++// packets. Keep early PCM queued, and represent a missing interval only when
++// both the original device position and timestamp support it.
++class WasapiCaptureBudget {
++ public:
++  using Packet = WasapiCaptureRetimer::Packet;
++
++  WasapiCaptureBudget(uint32_t sample_rate, uint16_t channels)
++      : rate_(sample_rate), channels_(channels), retimer_(sample_rate, channels) {}
++
++  void Prepare(uint32_t max_input_frames) {
++    retimer_.Prepare(max_input_frames);
++    const uint32_t storage_frames = QueueLimit() + 2 * max_input_frames +
++        2 * retimer_.max_output_frames() + FramesForMilliseconds(kMaxFillMs);
++    queue_.reserve(size_t{storage_frames} * channels_);
++    chunks_.reserve(storage_frames);
++    compressed_.resize(size_t{QueueLimit()} * channels_);
++    silence_.resize(size_t{FramesForMilliseconds(kMaxFillMs)} * channels_);
++  }
++
++  uint32_t max_output_frames() const { return retimer_.max_output_frames(); }
++  uint32_t queued_frames() const { return static_cast<uint32_t>(queue_.size() / channels_); }
++  uint64_t filled_frames() const { return filled_frames_; }
++  uint64_t compressed_frames() const { return compressed_frames_; }
++
++  template <typename Emit>
++  void Push(const int16_t* samples, Packet packet, uint64_t now, Emit&& emit) {
++    if (now == 0 || (last_now_ && now < last_now_)) {
++      // A clock restart invalidates the old deadline and gap evidence.
++      Drain(queued_frames(), emit);
++      read_epoch_ = capture_epoch_ = 0;
++      previous_ = {};
++    }
++    last_now_ = now;
++    if (!read_epoch_ && now && packet.valid && packet.qpc <= now) {
++      read_epoch_ = now;
++      capture_epoch_ = packet.qpc;
++      emitted_at_epoch_ = emitted_;
++    }
++
++    const uint64_t ceiling = read_epoch_
++        ? emitted_at_epoch_ + ElapsedFrames(now - read_epoch_) +
++              FramesForMilliseconds(kLeadMs)
++        : (std::numeric_limits<uint64_t>::max)();
++    uint32_t gap = ConfirmedGap(packet);
++    retimer_.Push(samples, packet, [&](const int16_t* pcm, Packet processed) {
++      // A previous packet held by the retimer belongs before this gap.
++      if (gap && (!processed.valid || processed.qpc >= packet.qpc)) {
++        AppendGap(packet, gap, ceiling);
++        gap = 0;
++      }
++      Append(pcm, processed);
++    });
++    if (gap) AppendGap(packet, gap, ceiling);
++    previous_ = packet;
++
++    const uint64_t possible = ceiling > emitted_ ? ceiling - emitted_ : 0;
++    Drain(static_cast<uint32_t>((std::min)(possible, uint64_t{queued_frames()})),
++          emit);
++    if (queued_frames() > QueueLimit()) CompressQueue();
++  }
++
++ private:
++  static constexpr uint64_t kTicksPerSecond = 10'000'000;
++  static constexpr uint32_t kLeadMs = 20;
++  static constexpr uint32_t kQueueMs = 70;
++  static constexpr uint32_t kMaxGapMs = 500;
++  static constexpr uint32_t kMaxFillMs = 250;
++
++  uint32_t FramesForMilliseconds(uint32_t ms) const { return rate_ * ms / 1000; }
++  uint32_t QueueLimit() const { return FramesForMilliseconds(kQueueMs); }
++
++  uint64_t ElapsedFrames(uint64_t ticks) const {
++    return ticks / kTicksPerSecond * rate_ +
++           ticks % kTicksPerSecond * rate_ / kTicksPerSecond;
++  }
++
++  uint32_t ConfirmedGap(const Packet& packet) const {
++    if (!capture_epoch_ || !previous_.valid || !packet.valid ||
++        previous_.position > (std::numeric_limits<uint64_t>::max)() - previous_.frames ||
++        packet.qpc <= previous_.qpc ||
++        packet.qpc - previous_.qpc > kMaxGapMs * 10'000) {
++      return 0;
++    }
++    const uint64_t end = previous_.position + previous_.frames;
++    const auto expected = ElapsedFrames(packet.qpc - previous_.qpc);
++    if (packet.position <= end || expected <= previous_.frames) return 0;
++    return static_cast<uint32_t>((std::min)({
++        packet.position - end, expected - previous_.frames,
++        uint64_t{FramesForMilliseconds(kMaxFillMs)}}));
++  }
++
++  void AppendGap(const Packet& packet, uint32_t gap, uint64_t ceiling) {
++    if (packet.qpc < capture_epoch_) return;
++    const uint64_t eligible = (std::min)(
++        ceiling, emitted_at_epoch_ + ElapsedFrames(packet.qpc - capture_epoch_));
++    const uint64_t known = emitted_ + queued_frames();
++    if (eligible <= known) return;
++    const auto frames = static_cast<uint32_t>((std::min)(eligible - known, uint64_t{gap}));
++    const uint64_t start = packet.qpc - uint64_t{frames} * kTicksPerSecond / rate_;
++    Append(silence_.data(), {packet.position - frames, start, frames, true, true});
++    filled_frames_ += frames;
++  }
++
++  void Append(const int16_t* pcm, Packet packet) {
++    if (!packet.frames) return;
++    queue_.insert(queue_.end(), pcm, pcm + size_t{packet.frames} * channels_);
++    chunks_.push_back(packet);
++  }
++
++  template <typename Emit>
++  void Drain(uint32_t frames, Emit& emit) {
++    uint32_t drained = 0;
++    size_t chunks_drained = 0;
++    while (drained < frames) {
++      Packet& head = chunks_[chunks_drained];
++      const uint32_t n = (std::min)({frames - drained, head.frames, max_output_frames()});
++      Packet piece = head;
++      piece.frames = n;
++      piece.valid = piece.valid && piece.qpc <= last_now_;
++      emit(queue_.data() + size_t{drained} * channels_, piece);
++      drained += n;
++      if (n == head.frames) {
++        ++chunks_drained;
++      } else {
++        head.frames -= n;
++        head.position += n;
++        head.qpc += uint64_t{n} * kTicksPerSecond / rate_;
++        head.discontinuity = false;
++      }
++    }
++    queue_.erase(queue_.begin(), queue_.begin() + size_t{drained} * channels_);
++    chunks_.erase(chunks_.begin(), chunks_.begin() + chunks_drained);
++    emitted_ += drained;
++  }
++
++  void CompressQueue() {
++    const uint32_t input = queued_frames();
++    const uint32_t output = QueueLimit();
++    // Keep the pending PCM in order while shortening the excess. The
++    // resampled span does not supply a fresh device capture timestamp.
++    WasapiCaptureRetimer::Resample(queue_.data(), input, channels_, output,
++                                  output, 0., compressed_.data());
++    queue_.assign(compressed_.begin(), compressed_.end());
++    chunks_.assign(1, Packet{0, 0, output, false, true});
++    compressed_frames_ += input - output;
++  }
++
++  const uint32_t rate_;
++  const uint16_t channels_;
++  WasapiCaptureRetimer retimer_;
++  Packet previous_;
++  uint64_t last_now_ = 0;
++  uint64_t read_epoch_ = 0;
++  uint64_t capture_epoch_ = 0;
++  uint64_t emitted_at_epoch_ = 0;
++  uint64_t emitted_ = 0;
++  uint64_t filled_frames_ = 0;
++  uint64_t compressed_frames_ = 0;
++  std::vector<int16_t> queue_;
++  std::vector<Packet> chunks_;
++  std::vector<int16_t> compressed_;
++  std::vector<int16_t> silence_;
++};
++
++}  // namespace webrtc
++
++#endif  // MODULES_AUDIO_DEVICE_WIN_WASAPI_CAPTURE_BUDGET_H_
+diff --git a/modules/audio_device/win/wasapi_capture_retimer.h b/modules/audio_device/win/wasapi_capture_retimer.h
+index fda52e2..ca1b313 100644
+--- a/modules/audio_device/win/wasapi_capture_retimer.h
++++ b/modules/audio_device/win/wasapi_capture_retimer.h
+@@ -87,12 +87,53 @@ class WasapiCaptureRetimer {
+     pending_ = packet;
+   }
+ 
++  // The same windowed sinc filter is used for short clock-domain conversions.
++  static void Resample(const int16_t* input,
++                       uint32_t input_frames,
++                       uint16_t channels,
++                       uint32_t output_frames,
++                       double nominal_frames,
++                       double first,
++                       int16_t* output) {
++    constexpr int filter_radius = 8;
++    const double stride = input_frames / nominal_frames;
++    const double cutoff = (std::min)(1.0, 1.0 / stride);
++    constexpr double kPi = 3.14159265358979323846;
++    for (uint32_t frame = 0; frame < output_frames; ++frame) {
++      const double center = (first + frame) * stride;
++      const int floor = static_cast<int>(center);
++      const int begin = (std::max)(0, floor - filter_radius + 1);
++      const int end = (std::min)(static_cast<int>(input_frames),
++                                 floor + filter_radius + 1);
++      // Clip the filter to this packet. Samples on the far side of a
++      // discontinuity must never take part in reconstruction.
++      double weight_sum = 0;
++      double weights[2 * filter_radius];
++      for (int tap = begin; tap < end; ++tap) {
++        const double x = kPi * (tap - center);
++        const double weight = Sinc(cutoff * x) * Sinc(x / filter_radius);
++        weights[tap - begin] = weight;
++        weight_sum += weight;
++      }
++      for (uint16_t channel = 0; channel < channels; ++channel) {
++        double value = 0;
++        for (int tap = begin; tap < end; ++tap) {
++          value += weights[tap - begin] *
++                   input[static_cast<size_t>(tap) * channels +
++                                    channel];
++        }
++        if (std::abs(weight_sum) > 1e-8) value /= weight_sum;
++        output[size_t{frame} * channels + channel] =
++            static_cast<int16_t>(std::round(std::clamp(value, -32768., 32767.)));
++      }
++    }
++  }
++
+  private:
+   static constexpr uint64_t kQpcPerSecond = 10'000'000;
+   static constexpr uint64_t kMaxInterval = 600'000;  // 60 ms.
+   static constexpr uint64_t kRateWindow = 2'000'000;  // 200 ms.
+   static constexpr int kRequiredWindows = 3;
+-  static constexpr int kFilterRadius = 8;
+ 
+   static bool Contiguous(const Packet& before, const Packet& after) {
+     return before.valid && after.valid && !after.discontinuity &&
+@@ -155,38 +196,9 @@ class WasapiCaptureRetimer {
+     if (output_frames == 0) return;
+     const double nominal_frames =
+         (end_qpc - pending_.qpc) * static_cast<double>(sample_rate_) / kQpcPerSecond;
+-    const double stride = pending_.frames / nominal_frames;
+-    const double cutoff = (std::min)(1.0, 1.0 / stride);
+-    const double first = to_grid / double{kQpcPerSecond};
+-    constexpr double kPi = 3.14159265358979323846;
+-    for (uint32_t frame = 0; frame < output_frames; ++frame) {
+-      const double center = (first + frame) * stride;
+-      const int floor = static_cast<int>(center);
+-      const int begin = (std::max)(0, floor - kFilterRadius + 1);
+-      const int end = (std::min)(static_cast<int>(pending_.frames),
+-                                 floor + kFilterRadius + 1);
+-      // Clip the filter to this packet. Samples on the far side of a
+-      // discontinuity must never take part in reconstruction.
+-      double weight_sum = 0;
+-      double weights[2 * kFilterRadius];
+-      for (int tap = begin; tap < end; ++tap) {
+-        const double x = kPi * (tap - center);
+-        const double weight = Sinc(cutoff * x) * Sinc(x / kFilterRadius);
+-        weights[tap - begin] = weight;
+-        weight_sum += weight;
+-      }
+-      for (uint16_t channel = 0; channel < channels_; ++channel) {
+-        double value = 0;
+-        for (int tap = begin; tap < end; ++tap) {
+-          value += weights[tap - begin] *
+-                   pending_samples_[static_cast<size_t>(tap) * channels_ +
+-                                    channel];
+-        }
+-        if (std::abs(weight_sum) > 1e-8) value /= weight_sum;
+-        corrected_samples_[size_t{frame} * channels_ + channel] =
+-            static_cast<int16_t>(std::round(std::clamp(value, -32768., 32767.)));
+-      }
+-    }
++    Resample(pending_samples_.data(), pending_.frames, channels_, output_frames,
++             nominal_frames, to_grid / double{kQpcPerSecond},
++             corrected_samples_.data());
+     Packet corrected = pending_;
+     corrected.frames = output_frames;
+     corrected.qpc += to_grid / sample_rate_;

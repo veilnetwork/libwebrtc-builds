@@ -642,6 +642,7 @@ jobs:
           call git apply "%GITHUB_WORKSPACE%\patches\windows-wasapi-capture-timestamps.patch" || exit /b 1
           call git apply "%GITHUB_WORKSPACE%\patches\windows-wasapi-capture-rate.patch" || exit /b 1
           call git apply "%GITHUB_WORKSPACE%\patches\windows-wasapi-render-rate.patch" || exit /b 1
+          call git apply "%GITHUB_WORKSPACE%\patches\windows-wasapi-capture-budget.patch" || exit /b 1
           call gn gen out/win-x64 --export-compile-commands --args="target_os=\"win\" target_cpu=\"x64\" is_debug=false is_component_build=false symbol_level=0 rtc_include_tests=false rtc_build_examples=false rtc_build_tools=false rtc_enable_protobuf=false rtc_use_h264=false enable_libaom=false rtc_include_opus=true treat_warnings_as_errors=false" || exit /b 1
           if not exist out\win-x64\compile_commands.json (
             echo ::error::gn produced no compile_commands.json - the bundle is built out of it
@@ -959,6 +960,7 @@ jobs:
           call git apply "%GITHUB_WORKSPACE%\patches\windows-wasapi-capture-timestamps.patch" || exit /b 1
           call git apply "%GITHUB_WORKSPACE%\patches\windows-wasapi-capture-rate.patch" || exit /b 1
           call git apply "%GITHUB_WORKSPACE%\patches\windows-wasapi-render-rate.patch" || exit /b 1
+          call git apply "%GITHUB_WORKSPACE%\patches\windows-wasapi-capture-budget.patch" || exit /b 1
           call gn gen out/win-arm64 --export-compile-commands --args="target_os=\"win\" target_cpu=\"arm64\" is_debug=false is_component_build=false symbol_level=0 rtc_include_tests=false rtc_build_examples=false rtc_build_tools=false rtc_enable_protobuf=false rtc_use_h264=false enable_libaom=false rtc_include_opus=true treat_warnings_as_errors=false" || exit /b 1
           if not exist out\win-arm64\compile_commands.json (
             echo ::error::gn produced no compile_commands.json - the bundle is built out of it
