@@ -94,9 +94,42 @@ void IgnoresOneFastWindowAndInvalidTimestamps() {
     assert(!retimer.active());
   }
 }
+void ReanchorsSourceDeadlinesAfterLongOutputStall() {
+  constexpr uint32_t kRate = 48000;
+  constexpr uint32_t kBlock = kRate / 100;
+  WasapiRenderRetimer retimer(kBlock, 1);
+  retimer.Observe(0, kEpoch, kRate);
+  retimer.Observe(9600, kEpoch + 1'000'000, kRate);
+  retimer.Observe(19200, kEpoch + 2'000'000, kRate);
+  assert(retimer.active());
+
+  std::vector<int16_t> output(kBlock);
+  unsigned pulls = 0;
+  const auto pull = [&](int16_t* pcm) {
+    ++pulls;
+    std::fill_n(pcm, kBlock, int16_t{3000});
+    return true;
+  };
+  const uint64_t start = kEpoch + 2'000'000;
+  assert(retimer.Render(start, output.data(), pull));
+  assert(pulls == 1);
+  // Recovery from an ordinary delayed callback still allows two due blocks.
+  assert(retimer.Render(start + 250'000, output.data(), pull));
+  assert(pulls == 3);
+
+  const uint64_t after_stall = start + 10'000'000;
+  assert(retimer.Render(after_stall, output.data(), pull));
+  assert(pulls == 4);
+  assert(retimer.Render(after_stall + 50'000, output.data(), pull));
+  assert(pulls == 4);
+  assert(retimer.Render(after_stall + 100'000, output.data(), pull));
+  assert(pulls == 5);
+}
+
 }  // namespace
 
 int main() {
+  ReanchorsSourceDeadlinesAfterLongOutputStall();
   IgnoresOneFastWindowAndInvalidTimestamps();
   CorrectsStableDeviceClock(48000, 100'000, 750);
   for (double tone : {750., 4000.}) {

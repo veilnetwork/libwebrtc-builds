@@ -121,10 +121,10 @@ index 8cde6a8..9809180 100644
        _UnLock();
 diff --git a/modules/audio_device/win/wasapi_render_retimer.h b/modules/audio_device/win/wasapi_render_retimer.h
 new file mode 100644
-index 0000000..f4ef0dd
+index 0000000..f393bd1
 --- /dev/null
 +++ b/modules/audio_device/win/wasapi_render_retimer.h
-@@ -0,0 +1,197 @@
+@@ -0,0 +1,203 @@
 +#ifndef MODULES_AUDIO_DEVICE_WIN_WASAPI_RENDER_RETIMER_H_
 +#define MODULES_AUDIO_DEVICE_WIN_WASAPI_RENDER_RETIMER_H_
 +
@@ -184,7 +184,13 @@ index 0000000..f4ef0dd
 +
 +  template <typename Pull>
 +  bool Render(uint64_t now_qpc, int16_t* destination, Pull&& pull) {
-+    if (!next_pull_qpc_) next_pull_qpc_ = now_qpc;
++    // A long output stall expires the old deadlines. The decoder keeps its
++    // own queued packets and resumes at the current pace.
++    if (!next_pull_qpc_ ||
++        (now_qpc > next_pull_qpc_ &&
++         now_qpc - next_pull_qpc_ > kMaxObservationGap)) {
++      next_pull_qpc_ = now_qpc;
++    }
 +    // Keep the source clock independent of the number of WASAPI requests.
 +    // Two overdue 10-ms blocks can catch up after a short device stall.
 +    for (int n = 0; n < 2 && now_qpc >= next_pull_qpc_ &&
