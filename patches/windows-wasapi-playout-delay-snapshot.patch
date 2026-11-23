@@ -1,0 +1,82 @@
+diff --git a/modules/audio_device/win/audio_device_core_win.cc b/modules/audio_device/win/audio_device_core_win.cc
+index e9be608..4f04cee 100644
+--- a/modules/audio_device/win/audio_device_core_win.cc
++++ b/modules/audio_device/win/audio_device_core_win.cc
+@@ -2636,7 +2636,7 @@ int32_t AudioDeviceWindowsCore::StopPlayout() {
+     }
+ 
+     // Reset the playout delay value.
+-    _sndCardPlayDelay = 0;
++    _sndCardPlayDelay.store(0, std::memory_order_relaxed);
+   }  // critScoped
+ 
+   return 0;
+@@ -2647,8 +2647,10 @@ int32_t AudioDeviceWindowsCore::StopPlayout() {
+ // ----------------------------------------------------------------------------
+ 
+ int32_t AudioDeviceWindowsCore::PlayoutDelay(uint16_t& delayMS) const {
+-  MutexLock lockScoped(&mutex_);
+-  delayMS = static_cast<uint16_t>(_sndCardPlayDelay);
++  // Receive-side RTP and RTCP only need the latest published delay.
++  // Audio client calls run under mutex_ and may wait on the device.
++  delayMS = static_cast<uint16_t>(
++      _sndCardPlayDelay.load(std::memory_order_relaxed));
+   return 0;
+ }
+ 
+@@ -2783,7 +2785,7 @@ DWORD AudioDeviceWindowsCore::DoRenderThread() {
+   playout_delay = WasapiRenderDelayMs(_devicePlaySampleRate, bufferLength,
+                                       bufferLength, pipeline_ms, 0,
+                                       std::nullopt, 0);
+-  _sndCardPlayDelay = playout_delay;
++  _sndCardPlayDelay.store(playout_delay, std::memory_order_relaxed);
+   _writtenSamples = 0;
+   RTC_LOG(LS_VERBOSE) << "[REND] initial delay        : " << playout_delay;
+ 
+@@ -2942,9 +2944,11 @@ DWORD AudioDeviceWindowsCore::DoRenderThread() {
+       // a bounded estimate of queued frames. It can overestimate consumption
+       // during the write, but never confuses stream lifetime with queue delay.
+       const uint32_t queued_at_write = padding + n10msBuffers * _playBlockSize;
+-      _sndCardPlayDelay = WasapiRenderDelayMs(
+-          _devicePlaySampleRate, bufferLength, queued_at_write, pipeline_ms,
+-          _writtenSamples, position, retimer.queued_frames());
++      _sndCardPlayDelay.store(
++          WasapiRenderDelayMs(_devicePlaySampleRate, bufferLength, queued_at_write,
++                              pipeline_ms, _writtenSamples, position,
++                              retimer.queued_frames()),
++          std::memory_order_relaxed);
+ 
+       _UnLock();
+     }
+@@ -3378,7 +3382,7 @@ DWORD AudioDeviceWindowsCore::DoCaptureThread() {
+               uint32_t rec_delay_ms = capture_age_ms + buffered_ms;
+               rec_delay_ms = rec_delay_ms >= 10 ? rec_delay_ms - 10 : 0;
+               const uint32_t play_delay_ms =
+-                  static_cast<uint32_t>(_sndCardPlayDelay);
++                  _sndCardPlayDelay.load(std::memory_order_relaxed);
+               while (syncBufIndex >= _recBlockSize) {
+                 if (_ptrAudioBuffer) {
+                   _ptrAudioBuffer->SetRecordedBuffer(
+diff --git a/modules/audio_device/win/audio_device_core_win.h b/modules/audio_device/win/audio_device_core_win.h
+index 578a1f6..36999d2 100644
+--- a/modules/audio_device/win/audio_device_core_win.h
++++ b/modules/audio_device/win/audio_device_core_win.h
+@@ -11,6 +11,8 @@
+ #ifndef MODULES_AUDIO_DEVICE_WIN_AUDIO_DEVICE_CORE_WIN_H_
+ #define MODULES_AUDIO_DEVICE_WIN_AUDIO_DEVICE_CORE_WIN_H_
+ 
++#include <atomic>
++
+ #include <wmcodecdsp.h>  // CLSID_CWMAudioAEC
+ //(must be before audioclient.h)
+ 
+@@ -258,7 +260,8 @@ class AudioDeviceWindowsCore : public AudioDeviceGeneric {
+   uint32_t _playBlockSize;
+   uint32_t _devicePlayBlockSize;
+   uint32_t _playChannels;
+-  uint32_t _sndCardPlayDelay;
++  static_assert(std::atomic<uint32_t>::is_always_lock_free);
++  std::atomic<uint32_t> _sndCardPlayDelay;
+   UINT64 _writtenSamples;
+   UINT64 _readSamples;
+ 
