@@ -1,51 +1,99 @@
 diff --git a/modules/audio_device/win/audio_device_core_win.cc b/modules/audio_device/win/audio_device_core_win.cc
 --- a/modules/audio_device/win/audio_device_core_win.cc
 +++ b/modules/audio_device/win/audio_device_core_win.cc
-@@ -2749,6 +2749,7 @@
- 
+@@ -2749,18 +2749,19 @@
+
    // >> ------------------ THREAD LOOP ------------------
- 
-+  int consecutive_timeouts = 0;
+
++  int consecutive_empty_timeouts = 0;
    while (keepPlaying) {
      // Wait for a render notification event or a shutdown event
      DWORD waitResult = WaitForMultipleObjects(2, waitArray, FALSE, 500);
-@@ -2757,9 +2758,13 @@
++    bool processed_audio = false;
+     switch (waitResult) {
+       case WAIT_OBJECT_0 + 0:  // _hShutdownRenderEvent
          keepPlaying = false;
          break;
        case WAIT_OBJECT_0 + 1:  // _hRenderSamplesReadyEvent
-+        consecutive_timeouts = 0;
          break;
 -      case WAIT_TIMEOUT:  // timeout notification
 -        RTC_LOG(LS_WARNING) << "render event timed out after 0.5 seconds";
+-        goto Exit;
 +      case WAIT_TIMEOUT:
-+        // A missed notification does not invalidate the device. Try the
-+        // same buffer path and keep waiting for shutdown or readiness.
-+        if (++consecutive_timeouts < 4) break;
-+        RTC_LOG(LS_WARNING) << "render event timed out four times";
-         goto Exit;
++        break;
        default:  // unexpected error
          RTC_LOG(LS_WARNING) << "unknown wait termination on render side";
-@@ -3159,6 +3164,7 @@
- 
+         goto Exit;
+@@ -2842,6 +2843,7 @@
+         EXIT_ON_ERROR(hr);
+
+         _writtenSamples += _playBlockSize;
++        processed_audio = true;
+       }
+
+       // Check the current delay on the playout side.
+@@ -2857,6 +2859,16 @@
+       }
+
+       _UnLock();
++    }
++
++    // A missing notification can still leave an accessible audio buffer.
++    // End only after repeated timeouts without any device progress.
++    if (waitResult != WAIT_TIMEOUT || processed_audio) {
++      consecutive_empty_timeouts = 0;
++    } else if (++consecutive_empty_timeouts == 4) {
++      RTC_LOG(LS_WARNING)
++          << "render event timed out four times without audio progress";
++      goto Exit;
+     }
+   }
+
+@@ -3159,18 +3171,19 @@
+
    // >> ---------------------------- THREAD LOOP ----------------------------
- 
-+  int consecutive_timeouts = 0;
+
++  int consecutive_empty_timeouts = 0;
    while (keepRecording) {
      // Wait for a capture notification event or a shutdown event
      DWORD waitResult = WaitForMultipleObjects(2, waitArray, FALSE, 500);
-@@ -3167,9 +3173,13 @@
++    bool processed_audio = false;
+     switch (waitResult) {
+       case WAIT_OBJECT_0 + 0:  // _hShutdownCaptureEvent
          keepRecording = false;
          break;
        case WAIT_OBJECT_0 + 1:  // _hCaptureSamplesReadyEvent
-+        consecutive_timeouts = 0;
          break;
 -      case WAIT_TIMEOUT:  // timeout notification
 -        RTC_LOG(LS_WARNING) << "capture event timed out after 0.5 seconds";
+-        goto Exit;
 +      case WAIT_TIMEOUT:
-+        // A missed notification does not invalidate the device. Try the
-+        // same buffer path and keep waiting for shutdown or readiness.
-+        if (++consecutive_timeouts < 4) break;
-+        RTC_LOG(LS_WARNING) << "capture event timed out four times";
-         goto Exit;
++        break;
        default:  // unexpected error
          RTC_LOG(LS_WARNING) << "unknown wait termination on capture side";
+         goto Exit;
+@@ -3237,6 +3250,7 @@
+         EXIT_ON_ERROR(hr);
+
+         _readSamples += framesAvailable;
++        processed_audio = true;
+         syncBufIndex += framesAvailable;
+
+         QueryPerformanceCounter(&t1);
+@@ -3293,6 +3307,16 @@
+
+       _UnLock();
+     }
++
++    // A missing notification can still leave an accessible audio buffer.
++    // End only after repeated timeouts without any device progress.
++    if (waitResult != WAIT_TIMEOUT || processed_audio) {
++      consecutive_empty_timeouts = 0;
++    } else if (++consecutive_empty_timeouts == 4) {
++      RTC_LOG(LS_WARNING)
++          << "capture event timed out four times without audio progress";
++      goto Exit;
++    }
+   }
+
+   // ---------------------------- THREAD LOOP ---------------------------- <<
