@@ -11,7 +11,7 @@ index c75cd4c..7a4e8c1 100644
          libs = [
            # Required for the built-in WASAPI AEC.
 diff --git a/modules/audio_device/win/audio_device_core_win.cc b/modules/audio_device/win/audio_device_core_win.cc
-index 8cde6a8..9809180 100644
+index 8cde6a8..6b8f386 100644
 --- a/modules/audio_device/win/audio_device_core_win.cc
 +++ b/modules/audio_device/win/audio_device_core_win.cc
 @@ -32,6 +32,7 @@
@@ -22,17 +22,52 @@ index 8cde6a8..9809180 100644
  #include "rtc_base/checks.h"
  #include "rtc_base/logging.h"
  #include "rtc_base/platform_thread.h"
-@@ -2698,6 +2699,9 @@ DWORD AudioDeviceWindowsCore::DoRenderThread() {
+@@ -2698,6 +2699,10 @@ DWORD AudioDeviceWindowsCore::DoRenderThread() {
    BYTE* pData = NULL;
    int playout_delay = 0;
    double endpointBufferSizeMS = 0.0;
++  double pipeline_ms = 0.0;
 +  WasapiRenderRetimer retimer(_playBlockSize, _playChannels);
 +  std::vector<int16_t> retimed_pcm(
 +      static_cast<size_t>(_playBlockSize) * _playChannels);
  
    // Initialize COM as MTA in this thread.
    ScopedCOMInitializer comInit(ScopedCOMInitializer::kMTA);
-@@ -2862,36 +2866,39 @@ DWORD AudioDeviceWindowsCore::DoRenderThread() {
+@@ -2742,7 +2747,9 @@ DWORD AudioDeviceWindowsCore::DoRenderThread() {
+   // Get maximum latency for the current stream (will not change for the
+   // lifetime  of the IAudioClient object).
+   //
+-  _ptrClientOut->GetStreamLatency(&latency);
++  if (FAILED(_ptrClientOut->GetStreamLatency(&latency))) {
++    latency = 0;
++  }
+   RTC_LOG(LS_VERBOSE) << "[REND] max stream latency   : " << (DWORD)latency
+                       << " (" << (double)(latency / 10000.0) << " ms)";
+
+@@ -2765,8 +2772,10 @@ DWORD AudioDeviceWindowsCore::DoRenderThread() {
+   // Derive initial rendering delay.
+   // Example: 10*(960/480) + 15 = 20 + 15 = 35ms
+   //
+-  playout_delay = 10 * (bufferLength / _playBlockSize) +
+-                  (int)((latency + devPeriod) / 10000);
++  pipeline_ms = (std::max)(0.0, (double(latency) + devPeriod) / 10000.0);
++  playout_delay = WasapiRenderDelayMs(_devicePlaySampleRate, bufferLength,
++                                      bufferLength, pipeline_ms, 0,
++                                      std::nullopt, 0);
+   _sndCardPlayDelay = playout_delay;
+   _writtenSamples = 0;
+   RTC_LOG(LS_VERBOSE) << "[REND] initial delay        : " << playout_delay;
+@@ -2844,7 +2853,8 @@ DWORD AudioDeviceWindowsCore::DoRenderThread() {
+       EXIT_ON_ERROR(hr);
+
+       // Derive the amount of available space in the output buffer
+-      uint32_t framesAvailable = bufferLength - padding;
++      const uint32_t framesAvailable =
++          bufferLength - (std::min)(padding, bufferLength);
+
+       // Do we have 10 ms available in the render buffer?
+       if (framesAvailable < _playBlockSize) {
+@@ -2862,36 +2872,39 @@ DWORD AudioDeviceWindowsCore::DoRenderThread() {
          EXIT_ON_ERROR(hr);
  
          if (_ptrAudioBuffer) {
@@ -97,34 +132,48 @@ index 8cde6a8..9809180 100644
          }
  
          DWORD dwFlags(0);
-@@ -2908,12 +2915,18 @@ DWORD AudioDeviceWindowsCore::DoRenderThread() {
+@@ -2904,17 +2917,27 @@ DWORD AudioDeviceWindowsCore::DoRenderThread() {
+         processed_audio = true;
+       }
+
+-      // Check the current delay on the playout side.
++      std::optional<WasapiRenderClockPosition> position;
        if (clock) {
          UINT64 pos = 0;
-         UINT64 freq = 1;
+-        UINT64 freq = 1;
 -        clock->GetPosition(&pos, NULL);
 -        clock->GetFrequency(&freq);
-+        UINT64 qpc = 0;
-+        const HRESULT position = clock->GetPosition(&pos, &qpc);
-+        const HRESULT frequency = clock->GetFrequency(&freq);
-+        if (position == S_OK && frequency == S_OK &&
-+            _playAudioFrameSize == _playChannels * sizeof(int16_t)) {
-+          retimer.Observe(pos, qpc, freq);
-+        }
-         playout_delay = ROUND((double(_writtenSamples) / _devicePlaySampleRate -
-                                double(pos) / freq) *
-                               1000.0);
+-        playout_delay = ROUND((double(_writtenSamples) / _devicePlaySampleRate -
+-                               double(pos) / freq) *
+-                              1000.0);
 -        _sndCardPlayDelay = playout_delay;
-+        _sndCardPlayDelay = playout_delay +
-+            static_cast<int>(retimer.queued_frames() * 1000 / _playSampleRate);
++        UINT64 freq = 0;
++        UINT64 qpc = 0;
++        const HRESULT position_result = clock->GetPosition(&pos, &qpc);
++        const HRESULT frequency_result = clock->GetFrequency(&freq);
++        if (position_result == S_OK && frequency_result == S_OK && freq > 0) {
++          position = WasapiRenderClockPosition{pos, freq};
++          if (_playAudioFrameSize == _playChannels * sizeof(int16_t)) {
++            retimer.Observe(pos, qpc, freq);
++          }
++        }
        }
++      // On a missing clock reading, the padding plus this completed write is
++      // a bounded estimate of queued frames. It can overestimate consumption
++      // during the write, but never confuses stream lifetime with queue delay.
++      const uint32_t queued_at_write = padding + n10msBuffers * _playBlockSize;
++      _sndCardPlayDelay = WasapiRenderDelayMs(
++          _devicePlaySampleRate, bufferLength, queued_at_write, pipeline_ms,
++          _writtenSamples, position, retimer.queued_frames());
  
        _UnLock();
+     }
 diff --git a/modules/audio_device/win/wasapi_render_retimer.h b/modules/audio_device/win/wasapi_render_retimer.h
 new file mode 100644
-index 0000000..cae23dc
+index 0000000..1620052
 --- /dev/null
 +++ b/modules/audio_device/win/wasapi_render_retimer.h
-@@ -0,0 +1,214 @@
+@@ -0,0 +1,246 @@
 +#ifndef MODULES_AUDIO_DEVICE_WIN_WASAPI_RENDER_RETIMER_H_
 +#define MODULES_AUDIO_DEVICE_WIN_WASAPI_RENDER_RETIMER_H_
 +
@@ -133,9 +182,41 @@ index 0000000..cae23dc
 +#include <cmath>
 +#include <cstddef>
 +#include <cstdint>
++#include <optional>
 +#include <vector>
 +
 +namespace webrtc {
++
++struct WasapiRenderClockPosition {
++  uint64_t offset;
++  uint64_t frequency;
++};
++
++// The endpoint reports frames queued for playback. Use that queue when the
++// device clock cannot produce a meaningful stream-relative delay.
++inline uint16_t WasapiRenderDelayMs(
++    uint32_t rate, uint32_t endpoint_capacity, uint32_t endpoint_frames,
++    double pipeline_ms, uint64_t written,
++    std::optional<WasapiRenderClockPosition> clock, double retimer_frames) {
++  if (!rate) return 0;
++  const double ms_per_frame = 1000.0 / rate;
++  double device_ms =
++      (std::min)(endpoint_frames, endpoint_capacity) * ms_per_frame + pipeline_ms;
++  if (clock && clock->frequency) {
++    const double measured_ms =
++        written * ms_per_frame - double(clock->offset) * 1000 / clock->frequency;
++    // A zero position can be valid just before the first audible sample.
++    // It cannot account for a long-running stream that still has room to write.
++    const bool initial_position = measured_ms <=
++        endpoint_capacity * ms_per_frame + pipeline_ms;
++    if (measured_ms >= 0 && measured_ms <= UINT16_MAX &&
++        (clock->offset != 0 || initial_position)) {
++      device_ms = measured_ms;
++    }
++  }
++  return static_cast<uint16_t>(std::round(std::clamp(
++      device_ms + retimer_frames * ms_per_frame, 0.0, double{UINT16_MAX})));
++}
 +
 +// Bridge a device consuming samples at a different rate from the QPC wall
 +// clock. Pull PCM in the 10 ms blocks expected by WebRTC, paced by QPC, and

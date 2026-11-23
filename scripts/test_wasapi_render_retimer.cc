@@ -4,6 +4,8 @@
 
 namespace {
 using webrtc::WasapiRenderRetimer;
+using webrtc::WasapiRenderDelayMs;
+using webrtc::WasapiRenderClockPosition;
 constexpr uint64_t kEpoch = 10'000'000;
 constexpr double kTau = 6.283185307179586;
 
@@ -158,11 +160,40 @@ void DiscardsOldPcmAfterLongOutputStall() {
                      [](int16_t sample) { return sample == -4000; }));
 }
 
+void UsesEndpointQueueWhenTheRenderClockCannotMeasureDelay() {
+  constexpr uint32_t kRate = 48000;
+  constexpr uint32_t kCapacity = 1440;
+  constexpr uint32_t kPadding = 960;
+  constexpr double kPipelineMs = 25;
+  constexpr uint64_t kWritten = kRate * 30;
+  constexpr double kResamplerFrames = 480;
+  const auto delay = [&](std::optional<WasapiRenderClockPosition> clock) {
+    return WasapiRenderDelayMs(kRate, kCapacity, kPadding, kPipelineMs,
+                               kWritten, clock, kResamplerFrames);
+  };
+
+  // Thirty seconds of submitted audio do not describe the size of the queue.
+  assert(delay(std::nullopt) == 55);
+  assert(delay(WasapiRenderClockPosition{0, 0}) == 55);
+  assert(delay(WasapiRenderClockPosition{0, kRate}) == 55);
+  // A position ahead of the submitted stream must not wrap to uint16_t.
+  assert(delay(WasapiRenderClockPosition{kWritten + 576, kRate}) == 55);
+  // Keep a valid direct playback measurement and the software queue.
+  assert(delay(WasapiRenderClockPosition{kWritten - 1680, kRate}) == 45);
+  // The device clock can include a downstream delay beyond reported padding.
+  assert(delay(WasapiRenderClockPosition{kWritten - 3360, kRate}) == 80);
+  // A driver with a genuinely large endpoint buffer may exceed 500 ms.
+  assert(WasapiRenderDelayMs(kRate, kRate, kRate / 2, 25, kWritten,
+                             WasapiRenderClockPosition{kWritten - 28800, kRate},
+                             0) == 600);
+}
+
 }  // namespace
 
 int main() {
   ReanchorsSourceDeadlinesAfterLongOutputStall();
   DiscardsOldPcmAfterLongOutputStall();
+  UsesEndpointQueueWhenTheRenderClockCannotMeasureDelay();
   IgnoresOneFastWindowAndInvalidTimestamps();
   CorrectsStableDeviceClock(48000, 100'000, 750);
   for (double tone : {750., 4000.}) {
