@@ -1,0 +1,324 @@
+diff --git a/modules/audio_device/BUILD.gn b/modules/audio_device/BUILD.gn
+index c75cd4c..7a4e8c1 100644
+--- a/modules/audio_device/BUILD.gn
++++ b/modules/audio_device/BUILD.gn
+@@ -374,6 +374,7 @@ rtc_library("audio_device_impl") {
+           "win/audio_device_core_win.h",
+           "win/wasapi_capture_retimer.h",
+           "win/wasapi_capture_timeline.h",
++          "win/wasapi_render_retimer.h",
+         ]
+         libs = [
+           # Required for the built-in WASAPI AEC.
+diff --git a/modules/audio_device/win/audio_device_core_win.cc b/modules/audio_device/win/audio_device_core_win.cc
+index 8cde6a8..9809180 100644
+--- a/modules/audio_device/win/audio_device_core_win.cc
++++ b/modules/audio_device/win/audio_device_core_win.cc
+@@ -32,6 +32,7 @@
+ #include "api/make_ref_counted.h"
+ #include "modules/audio_device/win/wasapi_capture_retimer.h"
+ #include "modules/audio_device/win/wasapi_capture_timeline.h"
++#include "modules/audio_device/win/wasapi_render_retimer.h"
+ #include "rtc_base/checks.h"
+ #include "rtc_base/logging.h"
+ #include "rtc_base/platform_thread.h"
+@@ -2698,6 +2699,9 @@ DWORD AudioDeviceWindowsCore::DoRenderThread() {
+   BYTE* pData = NULL;
+   int playout_delay = 0;
+   double endpointBufferSizeMS = 0.0;
++  WasapiRenderRetimer retimer(_playBlockSize, _playChannels);
++  std::vector<int16_t> retimed_pcm(
++      static_cast<size_t>(_playBlockSize) * _playChannels);
+ 
+   // Initialize COM as MTA in this thread.
+   ScopedCOMInitializer comInit(ScopedCOMInitializer::kMTA);
+@@ -2862,36 +2866,39 @@ DWORD AudioDeviceWindowsCore::DoRenderThread() {
+         EXIT_ON_ERROR(hr);
+ 
+         if (_ptrAudioBuffer) {
+-          // Request data to be played out (#bytes =
+-          // _playBlockSize*_audioFrameSize)
+-          _UnLock();
+-          int32_t nSamples =
+-              _ptrAudioBuffer->RequestPlayoutData(_playBlockSize);
+-          _Lock();
+-
+-          if (nSamples == -1) {
++          const auto pull = [&](void* buffer) {
+             _UnLock();
+-            RTC_LOG(LS_ERROR) << "failed to read data from render client";
+-            goto Exit;
++            const int32_t samples =
++                _ptrAudioBuffer->RequestPlayoutData(_playBlockSize);
++            _Lock();
++            if (samples == -1 || !_ptrRenderClient || !_ptrClientOut) {
++              return false;
++            }
++            if (samples != static_cast<int32_t>(_playBlockSize)) {
++              RTC_LOG(LS_WARNING) << "nSamples(" << samples
++                                  << ") != _playBlockSize" << _playBlockSize;
++            }
++            _ptrAudioBuffer->GetPlayoutData(buffer);
++            return true;
++          };
++
++          bool ok;
++          if (retimer.active()) {
++            LARGE_INTEGER now;
++            QueryPerformanceCounter(&now);
++            ok = retimer.Render(
++                static_cast<uint64_t>(now.QuadPart * _perfCounterFactor),
++                retimed_pcm.data(), pull);
++            if (ok) CopyMemory(pData, retimed_pcm.data(),
++                               _playBlockSize * _playAudioFrameSize);
++          } else {
++            ok = pull(pData);
+           }
+-
+-          // Sanity check to ensure that essential states are not modified
+-          // during the unlocked period
+-          if (_ptrRenderClient == NULL || _ptrClientOut == NULL) {
++          if (!ok) {
+             _UnLock();
+-            RTC_LOG(LS_ERROR)
+-                << "output state has been modified during unlocked"
+-                   " period";
++            RTC_LOG(LS_ERROR) << "render client changed or playout read failed";
+             goto Exit;
+           }
+-          if (nSamples != static_cast<int32_t>(_playBlockSize)) {
+-            RTC_LOG(LS_WARNING)
+-                << "nSamples(" << nSamples << ") != _playBlockSize"
+-                << _playBlockSize << ")";
+-          }
+-
+-          // Get the actual (stored) data
+-          nSamples = _ptrAudioBuffer->GetPlayoutData((int8_t*)pData);
+         }
+ 
+         DWORD dwFlags(0);
+@@ -2908,12 +2915,18 @@ DWORD AudioDeviceWindowsCore::DoRenderThread() {
+       if (clock) {
+         UINT64 pos = 0;
+         UINT64 freq = 1;
+-        clock->GetPosition(&pos, NULL);
+-        clock->GetFrequency(&freq);
++        UINT64 qpc = 0;
++        const HRESULT position = clock->GetPosition(&pos, &qpc);
++        const HRESULT frequency = clock->GetFrequency(&freq);
++        if (position == S_OK && frequency == S_OK &&
++            _playAudioFrameSize == _playChannels * sizeof(int16_t)) {
++          retimer.Observe(pos, qpc, freq);
++        }
+         playout_delay = ROUND((double(_writtenSamples) / _devicePlaySampleRate -
+                                double(pos) / freq) *
+                               1000.0);
+-        _sndCardPlayDelay = playout_delay;
++        _sndCardPlayDelay = playout_delay +
++            static_cast<int>(retimer.queued_frames() * 1000 / _playSampleRate);
+       }
+ 
+       _UnLock();
+diff --git a/modules/audio_device/win/wasapi_render_retimer.h b/modules/audio_device/win/wasapi_render_retimer.h
+new file mode 100644
+index 0000000..f4ef0dd
+--- /dev/null
++++ b/modules/audio_device/win/wasapi_render_retimer.h
+@@ -0,0 +1,197 @@
++#ifndef MODULES_AUDIO_DEVICE_WIN_WASAPI_RENDER_RETIMER_H_
++#define MODULES_AUDIO_DEVICE_WIN_WASAPI_RENDER_RETIMER_H_
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <cstddef>
++#include <cstdint>
++#include <vector>
++
++namespace webrtc {
++
++// Bridge a device consuming samples at a different rate from the QPC wall
++// clock. Pull PCM in the 10 ms blocks expected by WebRTC, paced by QPC, and
++// render interleaved PCM to the hardware's independently advancing clock.
++class WasapiRenderRetimer {
++ public:
++  WasapiRenderRetimer(uint32_t block_frames, uint16_t channels)
++      : block_frames_(block_frames),
++        channels_(channels),
++        capacity_(8 * block_frames),
++        input_(size_t{capacity_} * channels),
++        block_(size_t{block_frames} * channels) {}
++
++  void Observe(uint64_t position, uint64_t qpc, uint64_t frequency) {
++    if (!qpc || !frequency) return;
++    const ClockSample next{position, qpc};
++    if (frequency != frequency_ || position < latest_.position ||
++        qpc < latest_.qpc || qpc - latest_.qpc > kMaxObservationGap) {
++      oldest_ = count_ = 0;
++      direction_ = 0;
++      gate_ = next;
++      rate_ = 1;
++      frequency_ = frequency;
++    }
++    if (count_ && qpc == latest_.qpc) return;
++    latest_ = next;
++    if (count_ == history_.size()) PopClock();
++    history_[Index(count_++)] = next;
++    while (count_ > 1 && qpc - history_[Index(1)].qpc >= kRateWindow)
++      PopClock();
++    const ClockSample recent = history_[oldest_];
++    if (qpc - recent.qpc >= kRateWindow)
++      rate_ = std::clamp(ClockRate(recent, next), 0.25, 4.0);
++    if (!active_ && qpc - gate_.qpc >= kGateWindow) {
++      const double rate = ClockRate(gate_, next);
++      int direction = 0;
++      if (rate > 1.10) direction = 1;
++      if (rate < 0.90) direction = -1;
++      active_ = direction && direction == direction_;
++      direction_ = direction;
++      gate_ = next;
++    }
++  }
++
++  bool active() const { return active_; }
++
++  template <typename Pull>
++  bool Render(uint64_t now_qpc, int16_t* destination, Pull&& pull) {
++    if (!next_pull_qpc_) next_pull_qpc_ = now_qpc;
++    // Keep the source clock independent of the number of WASAPI requests.
++    // Two overdue 10-ms blocks can catch up after a short device stall.
++    for (int n = 0; n < 2 && now_qpc >= next_pull_qpc_ &&
++                    write_frame_ - OldestFrame() <= capacity_ - block_frames_;
++         ++n) {
++      if (!pull(block_.data())) return false;
++      for (uint32_t i = 0; i < block_frames_; ++i) {
++        const size_t slot = Slot(write_frame_++);
++        std::copy_n(&block_[size_t{i} * channels_], channels_, &input_[slot]);
++      }
++      next_pull_qpc_ += kBlockQpc;
++    }
++
++    const double queued = write_frame_ - source_frame_;
++    // Include the elapsed fraction toward the next source block in the
++    // occupancy estimate so quantized arrival does not modulate pitch.
++    const double phase = std::clamp(
++        (static_cast<double>(now_qpc) - next_pull_qpc_ + kBlockQpc) /
++            kBlockQpc,
++        0.0, 1.0);
++    filtered_occupancy_ +=
++        (queued / block_frames_ + phase - filtered_occupancy_) * 0.5;
++    const double rate = std::clamp(
++        1.0 / rate_ + (filtered_occupancy_ - 3.75) * 0.25, 0.25, 4.0);
++    const double step =
++        (std::min)(rate, (std::max)(0.0, queued / block_frames_ - 0.2));
++    Resample(destination, step);
++    return true;
++  }
++
++  double queued_frames() const { return write_frame_ - source_frame_; }
++
++ private:
++  struct ClockSample {
++    uint64_t position = 0, qpc = 0;
++  };
++  static constexpr uint64_t kQpcPerSecond = 10'000'000;
++  static constexpr uint64_t kBlockQpc = 100'000;
++  static constexpr uint64_t kRateWindow = 600'000;
++  static constexpr uint64_t kGateWindow = 1'000'000;
++  static constexpr uint64_t kMaxObservationGap = 2'500'000;
++  static constexpr int kRadius = 8;
++  static constexpr int kPhases = 64;
++  using Kernel = std::array<double, 2 * kRadius>;
++
++  size_t Index(size_t n) const { return (oldest_ + n) % history_.size(); }
++  void PopClock() {
++    oldest_ = Index(1);
++    --count_;
++  }
++
++  double ClockRate(ClockSample before, ClockSample after) const {
++    return (after.position - before.position) * double{kQpcPerSecond} /
++           frequency_ / (after.qpc - before.qpc);
++  }
++
++  uint64_t OldestFrame() const {
++    const auto index = static_cast<uint64_t>(source_frame_);
++    return index > kRadius ? index - kRadius : 0;
++  }
++
++  size_t Slot(uint64_t frame) const {
++    return static_cast<size_t>(frame % capacity_) * channels_;
++  }
++
++  static double Sinc(double x) {
++    return std::abs(x) < 1e-8 ? 1.0 : std::sin(x) / x;
++  }
++
++  void UpdateKernels(double step) {
++    const double cutoff = step > 1.0 ? 1.0 / step : 1.0;
++    if (std::abs(cutoff - kernel_cutoff_) < 0.005) return;
++    kernel_cutoff_ = cutoff;
++    constexpr double kPi = 3.14159265358979323846;
++    for (int phase = 0; phase <= kPhases; ++phase) {
++      auto& kernel = kernels_[phase];
++      double sum = 0;
++      for (int tap = 0; tap < 2 * kRadius; ++tap) {
++        const double x = kPi * (tap - kRadius + 1 - double(phase) / kPhases);
++        kernel[tap] = Sinc(x * cutoff) * Sinc(x / kRadius);
++        sum += kernel[tap];
++      }
++      for (double& weight : kernel) weight /= sum;
++    }
++  }
++
++  void Resample(int16_t* destination, double step) {
++    if (!write_frame_) {
++      std::fill_n(destination, size_t{block_frames_} * channels_, int16_t{0});
++      return;
++    }
++    UpdateKernels(step);
++    const double start = source_frame_;
++    for (uint32_t out = 0; out < block_frames_; ++out) {
++      const double cursor = start + out * step;
++      const auto frame = static_cast<int64_t>(cursor);
++      const int phase = static_cast<int>((cursor - frame) * kPhases + 0.5);
++      const auto& kernel = kernels_[phase];
++      std::array<size_t, 2 * kRadius> slots;
++      for (int tap = 0; tap < 2 * kRadius; ++tap) {
++        const int64_t index = std::clamp(frame + tap - kRadius + 1,
++            int64_t{0}, static_cast<int64_t>(write_frame_ - 1));
++        slots[tap] = Slot(index);
++      }
++      for (uint16_t channel = 0; channel < channels_; ++channel) {
++        double value = 0;
++        for (int tap = 0; tap < 2 * kRadius; ++tap)
++          value += kernel[tap] * input_[slots[tap] + channel];
++        destination[size_t{out} * channels_ + channel] =
++            static_cast<int16_t>(std::round(std::clamp(value,-32768.,32767.)));
++      }
++    }
++    source_frame_ = start + block_frames_ * step;
++  }
++
++  const uint32_t block_frames_;
++  const uint16_t channels_;
++  const uint32_t capacity_;
++  std::vector<int16_t> input_, block_;
++  std::array<ClockSample, 128> history_{};
++  size_t oldest_ = 0, count_ = 0;
++  ClockSample latest_, gate_;
++  uint64_t frequency_ = 0;
++  int direction_ = 0;
++  double rate_ = 1;
++  bool active_ = false;
++  uint64_t next_pull_qpc_ = 0;
++  uint64_t write_frame_ = 0;
++  double source_frame_ = 0;
++  double filtered_occupancy_ = 0;
++  std::array<Kernel,kPhases+1> kernels_;
++  double kernel_cutoff_ = 0;
++};
++
++}  // namespace webrtc
++
++#endif  // MODULES_AUDIO_DEVICE_WIN_WASAPI_RENDER_RETIMER_H_
