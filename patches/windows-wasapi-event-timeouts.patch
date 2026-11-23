@@ -1,0 +1,51 @@
+diff --git a/modules/audio_device/win/audio_device_core_win.cc b/modules/audio_device/win/audio_device_core_win.cc
+--- a/modules/audio_device/win/audio_device_core_win.cc
++++ b/modules/audio_device/win/audio_device_core_win.cc
+@@ -2749,6 +2749,7 @@
+ 
+   // >> ------------------ THREAD LOOP ------------------
+ 
++  int consecutive_timeouts = 0;
+   while (keepPlaying) {
+     // Wait for a render notification event or a shutdown event
+     DWORD waitResult = WaitForMultipleObjects(2, waitArray, FALSE, 500);
+@@ -2757,9 +2758,13 @@
+         keepPlaying = false;
+         break;
+       case WAIT_OBJECT_0 + 1:  // _hRenderSamplesReadyEvent
++        consecutive_timeouts = 0;
+         break;
+-      case WAIT_TIMEOUT:  // timeout notification
+-        RTC_LOG(LS_WARNING) << "render event timed out after 0.5 seconds";
++      case WAIT_TIMEOUT:
++        // A missed notification does not invalidate the device. Try the
++        // same buffer path and keep waiting for shutdown or readiness.
++        if (++consecutive_timeouts < 4) break;
++        RTC_LOG(LS_WARNING) << "render event timed out four times";
+         goto Exit;
+       default:  // unexpected error
+         RTC_LOG(LS_WARNING) << "unknown wait termination on render side";
+@@ -3159,6 +3164,7 @@
+ 
+   // >> ---------------------------- THREAD LOOP ----------------------------
+ 
++  int consecutive_timeouts = 0;
+   while (keepRecording) {
+     // Wait for a capture notification event or a shutdown event
+     DWORD waitResult = WaitForMultipleObjects(2, waitArray, FALSE, 500);
+@@ -3167,9 +3173,13 @@
+         keepRecording = false;
+         break;
+       case WAIT_OBJECT_0 + 1:  // _hCaptureSamplesReadyEvent
++        consecutive_timeouts = 0;
+         break;
+-      case WAIT_TIMEOUT:  // timeout notification
+-        RTC_LOG(LS_WARNING) << "capture event timed out after 0.5 seconds";
++      case WAIT_TIMEOUT:
++        // A missed notification does not invalidate the device. Try the
++        // same buffer path and keep waiting for shutdown or readiness.
++        if (++consecutive_timeouts < 4) break;
++        RTC_LOG(LS_WARNING) << "capture event timed out four times";
+         goto Exit;
+       default:  // unexpected error
+         RTC_LOG(LS_WARNING) << "unknown wait termination on capture side";

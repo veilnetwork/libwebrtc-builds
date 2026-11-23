@@ -9,6 +9,7 @@
 # arity), so a different pin does not fail to link — it fails to compile,
 # later, in a way that reads like the wrapper is wrong.
 WEBRTC_PIN=4ef980bc2c70834276c791e71e7834b8809f24ad
+SDK_RELEASE_SUFFIX=-wasapi1
 
 # depot_tools ships auto-updating build tooling that runs with full
 # permissions in the build job. Unpinned, every run executes whatever was

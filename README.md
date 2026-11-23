@@ -259,6 +259,12 @@ bash third_party/veil/flutter/veil_media/linux/build_veil_media_so_linux.sh
 
 `--expect-pin` is required, not optional: see "Detecting a mismatch" below.
 
+The Windows WASAPI fix is packaged under the `-wasapi1` release suffix.
+To select the patched Windows bundle, pass
+`--tag webrtc-4ef980bc2c70834276c791e71e7834b8809f24ad-wasapi1`
+and use a separate `--into` directory for this release. The SDK cache
+checks the upstream commit, which is shared by both releases.
+
 **Run it, then source it — not `eval "$(fetch-sdk.sh …)"`.** This file taught
 the `eval` form until xVeil's CI was written against it, and the `eval` form
 throws away the exact failure the pin check exists to raise. `eval` reports the
