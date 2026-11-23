@@ -126,10 +126,43 @@ void ReanchorsSourceDeadlinesAfterLongOutputStall() {
   assert(pulls == 5);
 }
 
+void DiscardsOldPcmAfterLongOutputStall() {
+  constexpr uint32_t kRate = 48000;
+  constexpr uint32_t kBlock = kRate / 100;
+  constexpr uint64_t kDeviceBlockQpc = 50'000;
+  WasapiRenderRetimer retimer(kBlock, 1);
+  std::vector<int16_t> output(kBlock);
+  int16_t level = 4000;
+  const auto pull = [&](int16_t* pcm) {
+    std::fill_n(pcm, kBlock, level);
+    return true;
+  };
+  for (uint64_t block = 0; block < 240; ++block) {
+    const uint64_t now = kEpoch + block * kDeviceBlockQpc;
+    retimer.Observe(block * kBlock, now, kRate);
+    if (retimer.active()) assert(retimer.Render(now, output.data(), pull));
+  }
+  assert(retimer.active());
+  assert(retimer.queued_frames() > kBlock);
+  assert(output.back() == 4000);
+
+  // A short delay must leave the already-decoded audio in the queue.
+  const uint64_t short_delay = kEpoch + 242 * kDeviceBlockQpc;
+  level = -4000;
+  assert(retimer.Render(short_delay, output.data(), pull));
+  assert(output.front() == 4000);
+
+  // Playback was stopped for 600 ms. The decoder can now supply fresh PCM.
+  assert(retimer.Render(short_delay + 6'000'000, output.data(), pull));
+  assert(std::all_of(output.begin(), output.end(),
+                     [](int16_t sample) { return sample == -4000; }));
+}
+
 }  // namespace
 
 int main() {
   ReanchorsSourceDeadlinesAfterLongOutputStall();
+  DiscardsOldPcmAfterLongOutputStall();
   IgnoresOneFastWindowAndInvalidTimestamps();
   CorrectsStableDeviceClock(48000, 100'000, 750);
   for (double tone : {750., 4000.}) {
