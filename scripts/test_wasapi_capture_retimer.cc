@@ -126,6 +126,52 @@ void FlushesGapWithoutInterpolatingAcrossIt() {
   });
   assert(emitted == 4);
 }
+
+void RecoversNominalCaptureAfterSustainedDrift(bool short_gaps) {
+  constexpr uint32_t kFrames = 480;
+  Retimer retimer(48000, 1);
+  retimer.Prepare(kFrames);
+  const std::vector<int16_t> pcm(kFrames, 2000);
+  uint64_t qpc = kQpcStart;
+  bool corrected = false;
+  unsigned tail_native = 0;
+  unsigned releases = 0;
+  uint64_t position = 0;
+  for (uint32_t i = 0; i < 300; ++i) {
+    const bool gap = short_gaps && i >= 120 && i % 12 == 0;
+    if (gap) {
+      position += kFrames;
+      qpc += 100000;
+    }
+    unsigned emitted = 0;
+    bool emitted_current = false;
+    retimer.Push(pcm.data(), {position, qpc, kFrames, true, gap},
+                 [&](const int16_t* samples, Retimer::Packet packet) {
+      ++emitted;
+      if (i < 120 && samples != pcm.data()) corrected = true;
+      if (i >= 120 && samples == pcm.data()) {
+        emitted_current = true;
+        assert(packet.position == position && packet.qpc == qpc);
+        if (emitted == 2) {
+          assert(packet.discontinuity);
+          ++releases;
+        }
+      }
+      if (i >= 270) {
+        assert(samples == pcm.data());
+        assert(packet.position == position);
+        assert(packet.qpc == qpc && packet.frames == kFrames);
+        ++tail_native;
+      }
+    });
+    assert(emitted <= 2);
+    if (emitted == 2) assert(emitted_current);
+    position += kFrames;
+    qpc += i < 119 ? 80000 : i % 2 == 0 ? 90000 : 110000;
+  }
+  assert(corrected && tail_native == 30 && releases == 1);
+}
+
 }  // namespace
 
 int main() {
@@ -133,4 +179,6 @@ int main() {
   CorrectsBothDirections(48000, 78901);
   CorrectsBothDirections(44100, 121234);
   FlushesGapWithoutInterpolatingAcrossIt();
+  RecoversNominalCaptureAfterSustainedDrift(false);
+  RecoversNominalCaptureAfterSustainedDrift(true);
 }

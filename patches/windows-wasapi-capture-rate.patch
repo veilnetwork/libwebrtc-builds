@@ -188,10 +188,10 @@ index beb1993..8cde6a8 100644
          // audio samples must wait for the next processing pass. The client
 diff --git a/modules/audio_device/win/wasapi_capture_retimer.h b/modules/audio_device/win/wasapi_capture_retimer.h
 new file mode 100644
-index 0000000..de7760a
+index 0000000..fda52e2
 --- /dev/null
 +++ b/modules/audio_device/win/wasapi_capture_retimer.h
-@@ -0,0 +1,176 @@
+@@ -0,0 +1,213 @@
 +#ifndef MODULES_AUDIO_DEVICE_WIN_WASAPI_CAPTURE_RETIMER_H_
 +#define MODULES_AUDIO_DEVICE_WIN_WASAPI_CAPTURE_RETIMER_H_
 +
@@ -237,13 +237,29 @@ index 0000000..de7760a
 +        emit(pending_samples_.data(), pending_);
 +        pending_ = {};
 +      }
-+      window_start_ = packet;
-+      direction_ = 0;
-+      windows_ = 0;
++      // Engagement still requires sustained contiguous capture. While
++      // correcting, short gaps do not erase evidence that the device has
++      // returned to a nominal rate. Broken intervals are never measured.
++      if (!correcting_ || !packet.valid || !last_rate_qpc_ ||
++          packet.qpc <= previous_.qpc ||
++          packet.qpc - last_rate_qpc_ > kMaxInterval) {
++        rate_qpc_ = 0;
++        rate_frames_ = 0;
++        last_rate_qpc_ = 0;
++        direction_ = 0;
++        windows_ = 0;
++      }
 +      packet.discontinuity = true;
 +      epoch_qpc_ = 0;
-+    } else if (!correcting_) {
++    } else {
++      const bool was_correcting = correcting_;
 +      ObserveRate(packet);
++      if (was_correcting && !correcting_ && pending_.frames > 0) {
++        Correct(packet.qpc, emit);
++        pending_ = {};
++        // Subsequent samples use the hardware timestamp and cadence again.
++        packet.discontinuity = true;
++      }
 +    }
 +    previous_ = packet;
 +
@@ -281,16 +297,35 @@ index 0000000..de7760a
 +  }
 +
 +  void ObserveRate(const Packet& packet) {
-+    const uint64_t elapsed = packet.qpc - window_start_.qpc;
-+    if (elapsed < kRateWindow) return;
-+    const double expected = elapsed * static_cast<double>(sample_rate_) / kQpcPerSecond;
-+    const double actual = packet.position - window_start_.position;
++    last_rate_qpc_ = packet.qpc;
++    rate_qpc_ += packet.qpc - previous_.qpc;
++    rate_frames_ += previous_.frames;
++    if (rate_qpc_ < kRateWindow) return;
++    const double expected = rate_qpc_ * static_cast<double>(sample_rate_) /
++                            kQpcPerSecond;
++    const double actual = rate_frames_;
++    rate_qpc_ = 0;
++    rate_frames_ = 0;
++    if (correcting_) {
++      // Require a narrower band to return to pass-through. A clock close to
++      // the engagement threshold should not alternate between modes.
++      const bool nominal = actual >= 0.95 * expected && actual <= 1.05 * expected;
++      windows_ = nominal ? windows_ + 1 : 0;
++      if (windows_ >= kRequiredWindows) {
++        correcting_ = false;
++        windows_ = 0;
++      }
++      return;
++    }
 +    const int direction = actual > 1.10 * expected ? 1 :
 +                          actual < 0.90 * expected ? -1 : 0;
 +    windows_ = direction == 0 ? 0 : direction == direction_ ? windows_ + 1 : 1;
 +    direction_ = direction;
-+    window_start_ = packet;
-+    correcting_ = windows_ >= kRequiredWindows;
++    if (windows_ >= kRequiredWindows) {
++      correcting_ = true;
++      windows_ = 0;
++      direction_ = 0;
++    }
 +  }
 +
 +  uint64_t SampleIndex(uint64_t qpc) const {
@@ -355,8 +390,10 @@ index 0000000..de7760a
 +  const uint32_t sample_rate_;
 +  const uint16_t channels_;
 +  Packet previous_;
-+  Packet window_start_;
 +  Packet pending_;
++  uint64_t last_rate_qpc_ = 0;
++  uint64_t rate_qpc_ = 0;
++  uint64_t rate_frames_ = 0;
 +  uint64_t epoch_qpc_ = 0;
 +  int direction_ = 0;
 +  int windows_ = 0;
