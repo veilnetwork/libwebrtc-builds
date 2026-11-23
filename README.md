@@ -266,9 +266,11 @@ a timeout both check the buffer at 10 ms intervals until notifications resume.
 The stream ends after two seconds without a notification or audio buffer
 progress.
 To select the patched Windows bundle, pass
-`--tag webrtc-4ef980bc2c70834276c791e71e7834b8809f24ad-wasapi1`
-and use a separate `--into` directory for this release. The SDK cache
-checks the upstream commit, which is shared by both releases.
+`--tag webrtc-4ef980bc2c70834276c791e71e7834b8809f24ad-wasapi1`.
+The cache matches the repository, release tag and upstream commit. A cache
+created before release tracking is downloaded and verified once on first use.
+Use separate `--into` directories to keep both releases available at the same
+time.
 
 **Run it, then source it — not `eval "$(fetch-sdk.sh …)"`.** This file taught
 the `eval` form until xVeil's CI was written against it, and the `eval` form

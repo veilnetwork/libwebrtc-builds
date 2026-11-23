@@ -5,7 +5,8 @@
 #
 # Prints the two variables the veil_media build scripts need, so a caller can
 #
-#   eval "$(fetch-sdk.sh --target linux-x64 --expect-pin "$WEBRTC_PIN")"
+#   fetch-sdk.sh --target linux-x64 --expect-pin "$WEBRTC_PIN" > sdk-env.sh
+#   . ./sdk-env.sh
 #   bash .../build_veil_media_so_linux.sh
 #
 # --expect-pin is the point of this script, not a convenience. The failure to
@@ -36,16 +37,20 @@ BASE="https://github.com/$REPO/releases/download/$TAG"
 BUNDLE="$INTO/veil-webrtc-sdk-$TARGET"
 mkdir -p "$INTO"
 
-# Already laid out and matching? Then this is a no-op, so a second CI step or a
-# second local build does not re-download 70 MB.
+# Releases can package different libraries from the same upstream commit.
+# Only a bundle verified against this repository and tag can be reused.
 manifest="$BUNDLE/veil-webrtc-sdk.json"
+origin="$BUNDLE/.veil-sdk-release-url"
 pin_of() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["webrtc_pin"])' "$1"; }
 
-if [ -f "$manifest" ] && [ "$(pin_of "$manifest")" = "$EXPECT" ]; then
+if [ -f "$origin" ] && [ "$(cat "$origin")" = "$BASE" ] &&
+   [ -f "$manifest" ] && [ "$(pin_of "$manifest")" = "$EXPECT" ]; then
   echo "==> $TARGET SDK already present at $BUNDLE" >&2
 else
+  stage="$(mktemp -d "$INTO/.sdk-$TARGET.XXXXXXXX")"
+  trap 'rm -rf "$stage"' EXIT
   echo "==> checking the published pin before downloading the bundle" >&2
-  probe="$INTO/.manifest-$TARGET.json"
+  probe="$stage/published-manifest.json"
   # No token. Release assets are public, unlike run artifacts, which need
   # credentials AND expire out from under a pinned build.
   curl -fsSL --retry 3 --retry-delay 5 -o "$probe" \
@@ -64,21 +69,24 @@ else
     win-*) ext="zip" ;;
     *)     ext="tar.xz" ;;
   esac
-  arc="$INTO/veil-webrtc-sdk-$TARGET.$ext"
+  arc="$stage/veil-webrtc-sdk-$TARGET.$ext"
   curl -fL --retry 3 --retry-delay 5 -o "$arc" "$BASE/veil-webrtc-sdk-$TARGET.$ext"
-  rm -rf "$BUNDLE"
   case "$ext" in
-    zip) unzip -q "$arc" -d "$INTO" ;;
-    *)   tar -C "$INTO" -xf "$arc" ;;
+    zip) unzip -q "$arc" -d "$stage" ;;
+    *)   tar -C "$stage" -xf "$arc" ;;
   esac
-  rm -f "$arc"
+  candidate="$stage/veil-webrtc-sdk-$TARGET"
+  candidate_manifest="$candidate/veil-webrtc-sdk.json"
+  cmp -s "$probe" "$candidate_manifest" || {
+    echo "::error::the $TARGET archive manifest differs from the published manifest for $TAG" >&2
+    exit 1; }
 
   # The archive travelled; prove it arrived whole rather than assuming it.
   # A truncated download extracts happily and fails at link time.
-  want="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["libwebrtc_sha256"])' "$manifest")"
-  name="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["libwebrtc_name"])' "$manifest")"
-  out="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["out_dir"])' "$manifest")"
-  lib="$BUNDLE/src/$out/obj/$name"
+  want="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["libwebrtc_sha256"])' "$probe")"
+  name="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["libwebrtc_name"])' "$probe")"
+  out="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["out_dir"])' "$probe")"
+  lib="$candidate/src/$out/obj/$name"
   if command -v sha256sum >/dev/null 2>&1; then
     have="$(sha256sum "$lib" | cut -d' ' -f1)"
   else
@@ -88,6 +96,9 @@ else
     echo "::error::$name does not match the manifest checksum — the download is corrupt or substituted" >&2
     exit 1; }
   echo "==> $name verified ($(wc -c < "$lib" | tr -d ' ') bytes)" >&2
+  printf '%s\n' "$BASE" > "$candidate/.veil-sdk-release-url"
+  rm -rf "$BUNDLE"
+  mv "$candidate" "$BUNDLE"
 fi
 
 # Windows lays the bundle out with setup.ps1, not setup.sh, and the paths it
